@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.egg
+
+# Secrets
+.env
+*.adsapirc
+*.cdsapirc
+
+# Cache
+.openmeteo_cache*
+*.cache
+
+# Trained models (large binaries; distribute separately)
+models/*.joblib
+models/*.pkl
+
+# Data files
+*.nc
+*.grib
+*.grib2
+*.csv.gz
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
