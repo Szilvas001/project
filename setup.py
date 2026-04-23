@@ -1,0 +1,39 @@
+from setuptools import find_packages, setup
+
+setup(
+    name="solar_forecast",
+    version="1.0.0",
+    packages=find_packages(),
+    install_requires=[
+        "pvlib>=0.10.5",
+        "numpy>=1.24.0",
+        "scipy>=1.11.0",
+        "pandas>=2.0.0",
+        "xgboost>=2.0.0",
+        "scikit-learn>=1.3.0",
+        "joblib>=1.3.0",
+        "sqlalchemy>=2.0.0",
+        "psycopg2-binary>=2.9.0",
+        "cdsapi>=0.6.0",
+        "xarray>=2023.6.0",
+        "netCDF4>=1.6.0",
+        "openmeteo-requests>=1.2.0",
+        "requests-cache>=1.1.0",
+        "retry-requests>=2.0.0",
+        "requests>=2.31.0",
+        "streamlit>=1.30.0",
+        "plotly>=5.18.0",
+        "pyyaml>=6.0",
+        "python-dotenv>=1.0.0",
+        "click>=8.1.0",
+        "tqdm>=4.66.0",
+    ],
+    python_requires=">=3.10",
+    entry_points={
+        "console_scripts": [
+            "sf-download=scripts.01_download_cams:main",
+            "sf-train=scripts.02_train_kt_model:main",
+            "sf-dashboard=scripts.03_run_dashboard:main",
+        ]
+    },
+)

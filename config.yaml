@@ -1,0 +1,51 @@
+# Solar Forecast Configuration
+# Copy this file and set your values. Secrets can be provided via .env.
+
+database:
+  host: localhost
+  port: 5432
+  name: solar_forecast
+  user: postgres
+  password: changeme        # or use env var PGPASSWORD
+
+# Copernicus ADS API (https://ads.atmosphere.copernicus.eu/)
+# Register and copy your UID:key from the profile page.
+cams:
+  api_url: "https://ads.atmosphere.copernicus.eu/api/v2"
+  api_key: ""               # or env var CAMS_API_KEY  (format: "uid:key")
+  # Training window for historical CAMS reanalysis
+  training_start: "2021-01-01"
+  training_end:   "2024-12-31"
+
+# Open-Meteo (free, no key required)
+openmeteo:
+  forecast_url:   "https://api.open-meteo.com/v1/forecast"
+  historical_url: "https://archive-api.open-meteo.com/v1/archive"
+  cache_expire_hours: 1
+
+# Default installation location
+location:
+  lat: 47.4979
+  lon: 19.0402
+  altitude: 120         # metres above sea level
+  name: "Budapest"
+
+# PV system parameters
+system:
+  capacity_kw: 10.0
+  tilt: null            # null = auto-compute from latitude (lat * 0.76)
+  azimuth: null         # null = 180° (south) for N hemisphere
+  module_efficiency: 0.205      # STC efficiency
+  temperature_coefficient: -0.0040   # relative, 1/°C
+  noct: 44                      # nominal operating cell temperature (°C)
+  ground_albedo: 0.20
+  inverter_efficiency: 0.970
+  wiring_loss: 0.020
+  soiling_loss: 0.020
+
+model:
+  kt_model_path: "models/kt_xgb.joblib"
+  # Weight of physics component in hybrid Kt (0=full AI, 1=full physics)
+  physics_weight: 0.40
+  # Minimum training samples required before AI is trusted
+  min_train_samples: 500
