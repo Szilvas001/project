@@ -1,23 +1,26 @@
 # Solar Forecast Configuration
-# Copy this file and set your values. Secrets can be provided via .env.
+# Copy this file and fill in your values. Secrets can be provided via .env.
 
 database:
   host: localhost
   port: 5432
   name: solar_forecast
   user: postgres
-  password: changeme        # or use env var PGPASSWORD
+  password: changeme        # or PGPASSWORD env var
 
-# Copernicus ADS API (https://ads.atmosphere.copernicus.eu/)
-# Register and copy your UID:key from the profile page.
+# Copernicus ADS API — https://ads.atmosphere.copernicus.eu/
+# Register, then copy UID:key from your profile page.
 cams:
   api_url: "https://ads.atmosphere.copernicus.eu/api/v2"
-  api_key: ""               # or env var CAMS_API_KEY  (format: "uid:key")
-  # Training window for historical CAMS reanalysis
+  api_key: ""               # or CAMS_API_KEY env var  (format: "uid:key")
   training_start: "2021-01-01"
   training_end:   "2024-12-31"
+  # Variable groups to download (all default on)
+  fetch_spectral_aod: true   # AOD at 469/670/865/1240 nm (Ångström exponents)
+  fetch_species_aod:  true   # Dust/BC/OM/SS/SO4 AOD (SSA + asymmetry factor)
+  fetch_optional:     true   # PM2.5, PM10, CO, NO2
 
-# Open-Meteo (free, no key required)
+# Open-Meteo (free, no API key required)
 openmeteo:
   forecast_url:   "https://api.open-meteo.com/v1/forecast"
   historical_url: "https://archive-api.open-meteo.com/v1/archive"
@@ -29,15 +32,17 @@ location:
   lon: 19.0402
   altitude: 120         # metres above sea level
   name: "Budapest"
+  timezone: "Europe/Budapest"   # IANA timezone for display
 
 # PV system parameters
 system:
   capacity_kw: 10.0
-  tilt: null            # null = auto-compute from latitude (lat * 0.76)
-  azimuth: null         # null = 180° (south) for N hemisphere
-  module_efficiency: 0.205      # STC efficiency
-  temperature_coefficient: -0.0040   # relative, 1/°C
-  noct: 44                      # nominal operating cell temperature (°C)
+  tilt: null            # null = auto-compute from latitude (lat × 0.76)
+  azimuth: null         # null = 180° south (N hemisphere)
+  technology: "mono_si" # mono_si | poly_si | cdte | cigs | hit
+  module_efficiency: 0.205
+  temperature_coefficient: -0.0040   # relative 1/°C
+  noct: 44              # nominal operating cell temperature (°C)
   ground_albedo: 0.20
   inverter_efficiency: 0.970
   wiring_loss: 0.020
@@ -45,7 +50,6 @@ system:
 
 model:
   kt_model_path: "models/kt_xgb.joblib"
-  # Weight of physics component in hybrid Kt (0=full AI, 1=full physics)
-  physics_weight: 0.40
-  # Minimum training samples required before AI is trusted
+  physics_weight: 0.40   # α: 0 = full AI, 1 = full physics
   min_train_samples: 500
+  n_cv_folds: 5           # cross-validation folds (0 = skip CV)
