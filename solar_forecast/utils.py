@@ -116,3 +116,53 @@ def geocode_city(city: str) -> tuple[float, float, str]:
         raise ValueError(f"City not found: {city!r}")
     r = results[0]
     return float(r["latitude"]), float(r["longitude"]), r.get("name", city)
+
+
+def ensure_utc(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure a DataFrame has a tz-aware UTC DatetimeIndex.
+
+    If the index is naive, it is localized to UTC (assumed UTC).
+    If it is in another timezone, it is converted to UTC.
+    """
+    if df.empty:
+        return df
+    df = df.copy()
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index, errors="coerce")
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC")
+    else:
+        df.index = df.index.tz_convert("UTC")
+    return df
+
+
+def to_local(df: pd.DataFrame, tz: str) -> pd.DataFrame:
+    """
+    Convert a UTC-indexed DataFrame's index to a local timezone.
+
+    CRITICAL: CAMS always returns UTC, Open-Meteo is requested in UTC.
+    Call this only for display purposes, not for computation.
+
+    Parameters
+    ----------
+    df : DataFrame with UTC DatetimeIndex (tz-aware)
+    tz : IANA timezone string (e.g. 'Europe/Budapest', 'US/Eastern')
+
+    Returns
+    -------
+    DataFrame with tz-aware index in `tz`.
+    """
+    if df.empty:
+        return df
+    df = ensure_utc(df)
+    df = df.copy()
+    df.index = df.index.tz_convert(tz)
+    return df
+
+
+def utc_now() -> pd.Timestamp:
+    """Return current time as a tz-aware UTC pandas Timestamp."""
+    return pd.Timestamp.utcnow().tz_localize("UTC") \
+        if pd.Timestamp.utcnow().tz is None \
+        else pd.Timestamp.utcnow()

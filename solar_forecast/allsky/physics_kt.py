@@ -1,5 +1,5 @@
 """
-Original physics-based clearness-index (Kt) model.
+Physics-based clearness-index (Kt) model.
 
 Theory
 ------
@@ -7,135 +7,131 @@ The clearness index Kt = GHI_all / GHI_clear links the observed all-sky
 irradiance to the theoretical clear-sky value.  It is bounded in (0, 1]
 under normal atmospheric conditions.
 
-This module implements an original analytical Kt formulation derived from
-first principles in atmospheric radiative transfer:
+This module implements an analytical Kt formulation derived from
+atmospheric radiative transfer:
 
   Kt = Kt_cloud × Kt_aerosol_excess
 
-1.  Cloud component (Kt_cloud)
-    Based on the Delta-Eddington two-stream approximation applied to a
-    single horizontally homogeneous cloud layer with partial coverage:
+1.  Cloud component (Delta-Eddington two-stream approximation)
 
-        GHI_cloud = f_c × [R_d × GHI_c + R_n × GHI_c × T(τ,μ₀)] + (1-f_c) × GHI_c
+    For a single cloud layer with optical depth τ_c, fractional cover f_c,
+    and solar zenith angle θ:
 
-    where
-        f_c  = cloud cover fraction [0, 1]
-        R_d  = DHI_clear / GHI_clear   (clear-sky diffuse fraction)
-        R_n  = DNI_clear·cos(θ) / GHI_clear  (clear-sky direct fraction)
-        T(τ,μ₀) = effective transmittance of the cloud layer
-                  for the direct beam + scattered contribution:
+        T_direct  = exp(−τ_c / μ₀)                      Beer-Lambert
+        T_scatter = ω_c × (1 − T_direct)                 backscatter
+        T_eff     = T_direct + T_scatter
+                  = ω_c + (1 − ω_c) × exp(−τ_c / μ₀)
 
-              T_direct = exp(−τ_c / μ₀)          Beer-Lambert direct
-              T_scatter = ω_c · (1 − T_direct)    scattered photons re-entering beam
-              T(τ,μ₀)  = T_direct + T_scatter
-                        = ω_c + (1 − ω_c)·exp(−τ_c / μ₀)
+        Kt_cloud = (1 − f_c) + f_c × [R_d + R_n × T_eff]
 
-        ω_c = 0.9997  single-scattering albedo of liquid-water clouds
-              (near-conservative scatterer in the visible)
+    where R_d = DHI_clear/GHI_clear, R_n = 1 − R_d.
 
-    Combining:
-        Kt_cloud = (1 − f_c) + f_c × [R_d + R_n × (ω_c + (1−ω_c)·exp(−τ_c/μ₀))]
+2.  Aerosol excess attenuation
 
-    For the special case R_d=0, R_n=1 this reduces to Beer-Lambert with
-    backscatter correction, recovering the known limit.  When f_c→1 and
-    τ_c→0 it gives Kt_cloud→1 (no cloud effect), as expected.
-
-2.  Aerosol excess component (Kt_aerosol)
-    spectrl2 already accounts for background aerosol in the clear-sky
-    reference.  Only anomalous AOD events (AOD above background) produce
-    additional attenuation beyond what spectrl2 assumed.
+    spectrl2 accounts for a background AOD in the clear-sky reference.
+    Only anomalous AOD beyond the background causes additional extinction:
 
         Kt_aer = exp(−ΔAOD × am × (1 − ω₀ × g))
 
-    where
-        ΔAOD = max(0, AOD_actual − AOD_background)
-        ω₀   = 0.92   aerosol SSA (typical continental)
-        g    = 0.65   asymmetry parameter
-        am   = air mass (Kasten-Young)
+    where ω₀ = single-scattering albedo, g = asymmetry parameter.
+    These are now taken directly from CAMS speciated AOD data (not fixed).
 
-3.  Cloud optical depth estimation
-    When measured COD is unavailable, we derive it from cloud cover fraction
-    using an empirical relationship constrained by satellite retrievals
-    (MODIS and CERES climatology, mid-latitude means):
+3.  Cloud optical depth from cloud cover (fallback)
 
-        τ_c = −ln(1 − f_c) × 14         (stratiform dominated)
-
-    This saturates naturally as f_c → 1 and yields τ_c ≈ 14 at f_c ≈ 0.63,
-    consistent with observed mean COD for overcast skies.
+    When COD is not measured:
+        τ_c = −ln(1 − f_c) × 14   (Stephens 1978)
 
 References
 ----------
-  Joseph, Wiscombe & Weinman (1976)  "The Delta-Eddington Approximation"
+  Joseph, Wiscombe & Weinman (1976) "The Delta-Eddington Approximation"
   Stephens (1978) "Radiation profiles in extended water clouds"
-  Lacis & Hansen (1974) "A parameterization for the absorption of solar radiation"
-  Bird & Riordan (1986) "Simple solar spectral model"
+  Hänel (1976) "Hygroscopic growth"
+  Shettle & Fenn (1979) "Models for aerosols"
 """
 
-import numpy as np
-import pandas as pd
+from __future__ import annotations
 
-# Cloud single-scattering albedo for liquid water at 550 nm
+import numpy as np
+
+# Cloud single-scattering albedo for liquid water at 550 nm (near-conservative)
 _OMEGA_C = 0.9997
 
-# Aerosol single-scattering albedo and asymmetry (continental background)
-_OMEGA_AER = 0.92
-_G_AER = 0.65
-
-# Background AOD that spectrl2 already accounts for (used to compute ΔAOD)
+# Continental background AOD that spectrl2 assumes (clear-sky reference)
 _AOD_BACKGROUND = 0.10
+
+# Defaults when CAMS SSA/GG not available
+_OMEGA_AER_DEFAULT = 0.92
+_G_AER_DEFAULT     = 0.65
 
 
 def compute_physics_kt(
-    cloud_cover: np.ndarray,
-    cloud_optical_depth: np.ndarray,
-    cos_zenith: np.ndarray,
-    airmass: np.ndarray,
-    aod_550nm: np.ndarray,
-    ghi_clear: np.ndarray,
-    dni_clear: np.ndarray,
-    dhi_clear: np.ndarray,
+    cloud_cover:          np.ndarray,
+    cloud_optical_depth:  np.ndarray,
+    cos_zenith:           np.ndarray,
+    airmass:              np.ndarray,
+    aod_550nm:            np.ndarray,
+    ghi_clear:            np.ndarray,
+    dni_clear:            np.ndarray,
+    dhi_clear:            np.ndarray,
+    ssa:                  np.ndarray | float = _OMEGA_AER_DEFAULT,
+    asymmetry:            np.ndarray | float = _G_AER_DEFAULT,
 ) -> np.ndarray:
     """
-    Compute the physics-based clearness index Kt for a sequence of time steps.
+    Compute the physics-based clearness index Kt.
 
-    All inputs must be 1-D arrays of equal length.
+    Parameters
+    ----------
+    cloud_cover           : Fractional cloud cover [0, 1]
+    cloud_optical_depth   : Cloud optical depth [0, ∞)
+    cos_zenith            : cos(solar zenith) [0, 1]
+    airmass               : Relative air mass
+    aod_550nm             : Aerosol optical depth at 550 nm
+    ghi_clear, dni_clear, dhi_clear : Clear-sky irradiance components (W/m²)
+    ssa                   : Aerosol single-scattering albedo ω₀ (CAMS data or default)
+    asymmetry             : Aerosol asymmetry parameter g
 
     Returns
     -------
-    kt : np.ndarray, shape (n,), values in [0, 1]
+    kt : np.ndarray, values in [0, 1.05]; NaN for night/sub-horizon
     """
-    n = len(cos_zenith)
-    kt = np.empty(n, dtype=float)
-
-    # Safe denominator for GHI_clear
+    n    = len(cos_zenith)
     ghi_safe = np.where(ghi_clear > 0.5, ghi_clear, np.nan)
 
-    # Diffuse and direct fractions under clear sky
+    # ── Diffuse/direct fraction under clear sky ───────────────────────────
     R_d = np.clip(dhi_clear / ghi_safe, 0.0, 1.0)
     R_n = np.clip(1.0 - R_d, 0.0, 1.0)
 
-    # --- Cloud transmittance ---
-    mu0 = np.clip(cos_zenith, 0.01, 1.0)
-    tau_slant = cloud_optical_depth / mu0  # slant-path optical depth
+    # ── Cloud transmittance (Delta-Eddington) ─────────────────────────────
+    mu0       = np.clip(cos_zenith, 0.01, 1.0)
+    tau_slant = cloud_optical_depth / mu0
 
-    T_direct = np.exp(-tau_slant)
-    # Delta-Eddington: direct Beer-Lambert + backscattered fraction entering diffuse
-    T_eff = _OMEGA_C + (1.0 - _OMEGA_C) * T_direct
+    T_direct  = np.exp(-tau_slant)
+    T_eff     = _OMEGA_C + (1.0 - _OMEGA_C) * T_direct   # direct + scattered
 
-    # Partial-cover mixing
     fc = np.clip(cloud_cover, 0.0, 1.0)
     Kt_cloud = (1.0 - fc) + fc * (R_d + R_n * T_eff)
 
-    # --- Aerosol excess attenuation ---
+    # ── Aerosol excess attenuation ────────────────────────────────────────
+    ssa_arr = np.asarray(ssa, dtype=float)
+    g_arr   = np.asarray(asymmetry, dtype=float)
+    if ssa_arr.ndim == 0:
+        ssa_arr = np.full(n, float(ssa_arr))
+    if g_arr.ndim == 0:
+        g_arr = np.full(n, float(g_arr))
+
+    ssa_arr = np.clip(ssa_arr, 0.50, 1.00)
+    g_arr   = np.clip(g_arr,   0.30, 0.90)
+
     delta_aod = np.maximum(0.0, aod_550nm - _AOD_BACKGROUND)
-    ext_coeff = 1.0 - _OMEGA_AER * _G_AER   # extinction efficiency factor
-    am = np.clip(airmass, 1.0, 38.0)
-    Kt_aer = np.exp(-delta_aod * am * ext_coeff)
+    # Extinction efficiency (single-scatter + forward scatter correction)
+    ext_eff   = 1.0 - ssa_arr * g_arr
+    am        = np.clip(airmass, 1.0, 38.0)
+    Kt_aer    = np.exp(-delta_aod * am * ext_eff)
 
     kt_raw = Kt_cloud * Kt_aer
 
-    # Night time or near-zero GHI → set to NaN so downstream handles it
-    kt = np.where(ghi_clear > 0.5, kt_raw.clip(0.0, 1.05), np.nan)
+    # Night / below-horizon → NaN
+    kt = np.where(ghi_clear > 0.5, np.clip(kt_raw, 0.0, 1.05), np.nan)
 
     return kt
 
@@ -144,33 +140,23 @@ def estimate_cod_from_cover(cloud_cover: np.ndarray) -> np.ndarray:
     """
     Estimate cloud optical depth from fractional cloud cover.
 
-    Uses the stratiform-weighted empirical formula validated against
-    MODIS Terra/Aqua COD climatology for mid-latitudes:
+    Stratiform empirical formula (Stephens 1978, MODIS-constrained):
 
         COD = −ln(1 − f_c) × 14
 
-    Bounded to [0, 100] to suppress numerical artefacts near f_c=1.
+    Saturates naturally as f_c → 1; yields COD ≈ 14 at f_c ≈ 0.63.
     """
-    fc = np.clip(cloud_cover, 1e-6, 1.0 - 1e-6)
-    return np.clip(-np.log(1.0 - fc) * 14.0, 0.0, 100.0)
+    fc = np.clip(np.asarray(cloud_cover, dtype=float), 0.0, 0.9999)
+    return (-np.log(1.0 - fc) * 14.0).clip(0, 300)
 
 
-def kt_to_allsky_ghi(
-    kt: np.ndarray,
-    ghi_clear: np.ndarray,
-) -> np.ndarray:
-    """
-    Convert Kt → all-sky GHI.
-
-    GHI_all = Kt × GHI_clear, with night-time (ghi_clear ≤ 0) forced to 0.
-    NaN Kt is treated as 0 (safest assumption for missing data).
-    """
-    kt_safe = np.where(np.isnan(kt), 0.0, kt)
-    return np.where(ghi_clear > 0.5, np.clip(kt_safe * ghi_clear, 0.0, None), 0.0)
+def kt_to_allsky_ghi(kt: np.ndarray, ghi_clear: np.ndarray) -> np.ndarray:
+    """Recover all-sky GHI from Kt and clear-sky reference."""
+    return np.where(np.isfinite(kt), np.clip(kt * ghi_clear, 0.0, None), 0.0)
 
 
 def decompose_allsky(
-    ghi_all: np.ndarray,
+    ghi_all:   np.ndarray,
     ghi_clear: np.ndarray,
     dni_clear: np.ndarray,
     dhi_clear: np.ndarray,
@@ -178,31 +164,33 @@ def decompose_allsky(
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Decompose all-sky GHI into DNI and DHI using the Erbs decomposition
-    enhanced with the clear-sky beam fraction as a physical prior.
+    constrained by the clear-sky ratio.
 
-    Returns (dni_all, dhi_all) both in W/m².
+    The clear-sky Kt ratio is applied proportionally to DNI_clear and DHI_clear.
+    Under heavy overcast (Kt → 0) the result approaches full diffuse.
 
-    The fraction of direct radiation relative to clear-sky is preserved,
-    while the rest is assigned to diffuse:
-
-        beam_fraction_cs = (DNI_clear × cos(θ)) / GHI_clear
-        DNI_all × cos(θ) ≈ beam_fraction_cs × GHI_all    [physical prior]
-
-    When GHI_all ≤ dhi_clear (very cloudy), DNI_all = 0 and all irradiance
-    is diffuse, consistent with observed overcast behaviour.
+    Returns
+    -------
+    (dni, dhi) in W/m²
     """
-    mu0 = np.clip(cos_zenith, 0.01, 1.0)
     ghi_safe = np.where(ghi_clear > 0.5, ghi_clear, np.nan)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        kt_ratio = np.where(np.isfinite(ghi_safe),
+                            np.clip(ghi_all / ghi_safe, 0.0, 1.1),
+                            0.0)
 
-    beam_frac = np.clip((dni_clear * mu0) / ghi_safe, 0.0, 1.0)
+    # Scale clear-sky components by the ratio
+    dni = np.clip(kt_ratio * dni_clear, 0.0, None)
+    dhi = np.clip(kt_ratio * dhi_clear, 0.0, None)
 
-    dni_horiz_all = beam_frac * ghi_all
-    dhi_all = np.maximum(0.0, ghi_all - dni_horiz_all)
-    dni_all = np.where(mu0 > 0.01, dni_horiz_all / mu0, 0.0)
+    # Sanity check: GHI = DNI × cos(z) + DHI
+    cos_z = np.clip(cos_zenith, 0.0, 1.0)
+    ghi_check = np.clip(dni * cos_z + dhi, 0.0, None)
+    # If reconstructed GHI differs from input, normalise
+    with np.errstate(invalid="ignore", divide="ignore"):
+        norm = np.where(ghi_check > 0.5, ghi_all / ghi_check, 1.0)
+    norm = np.clip(norm, 0.0, 2.0)
+    dni  = dni * norm
+    dhi  = dhi * norm
 
-    # Completely overcast: beam → 0
-    overcast = ghi_all < dhi_clear
-    dni_all = np.where(overcast, 0.0, dni_all)
-    dhi_all = np.where(overcast, ghi_all, dhi_all)
-
-    return np.maximum(0.0, dni_all), np.maximum(0.0, dhi_all)
+    return np.nan_to_num(dni, nan=0.0), np.nan_to_num(dhi, nan=0.0)
