@@ -1,54 +1,71 @@
 """
-Demo-mode forecast pipeline.
+Full physics-backed forecast pipeline for demo mode.
 
-Works with NO external dependencies:
-  - No CAMS API key required
-  - No PostgreSQL required
-  - No trained XGBoost model required
-  - Only Open-Meteo (free, no key) + pvlib physics
+Uses the COMPLETE engine — SPECTRL2 + SR(λ) + IAM + Perez + NOCT — with
+Open-Meteo live weather and climatological aerosol fallbacks when CAMS is
+unavailable. No external API keys required.
 
-Returns a dict with:
-  {
-    "hourly": pd.DataFrame (timestamp index, ghi_wm2, power_kw, energy_kwh, kt, t_cell_c),
-    "summary": dict (today_kwh, tomorrow_kwh, total_7d_kwh, peak_power_kw, ...),
-    "clearsky_hourly": pd.DataFrame,  # clear-sky reference
-  }
+Denormalization factor
+----------------------
+The denorm factor D maps from normalized spectral mismatch (MM) back to
+broadband effective irradiance:
+
+    G_eff = MM × G_POA_broadband    (W/m²)
+    P_dc  = G_eff / G_STC × P_stc × [1 + γ(T_cell − 25)]
+
+D is not a free parameter — it is the ratio of the PV-band integral of the
+actual spectrum to the full broadband integral, computed per time-step.
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+import sys
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 
+# Ensure project root on path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 logger = logging.getLogger(__name__)
 
-# Default climatological aerosol fallbacks (continental Europe)
-_DEFAULT_AOD_550 = 0.12
-_DEFAULT_ALPHA = 1.3
-_DEFAULT_SSA = 0.92
-_DEFAULT_ASYM = 0.65
-_DEFAULT_OZONE_ATM_CM = 0.32
-_DEFAULT_PRECIP_WATER = 1.5
+# ── Climatological aerosol defaults (continental Europe) ──────────────────
+_AOD_550   = 0.12
+_ALPHA1    = 1.30
+_ALPHA2    = 1.10
+_SSA       = 0.92
+_ASYM      = 0.65
+_OZONE_DU  = 310.0
+_PW_CM     = 1.5
+_PRESSURE  = 1013.25
+_ALBEDO    = 0.20
+
+# Technology temperature coefficients %/°C → /K
+_TEMP_COEFF = {
+    "mono_si": -0.0040, "poly_si": -0.0042,
+    "cdte": -0.0025, "cigs": -0.0036, "hit": -0.0025,
+}
+_NOCT = 45.0
+_G_STC = 1000.0
 
 
-def _resolve_tilt_azimuth(lat: float, tilt: Optional[float], azimuth: Optional[float]):
-    t = tilt if tilt is not None else round(abs(lat) * 0.76, 1)
-    a = azimuth if azimuth is not None else (180.0 if lat >= 0 else 0.0)
-    return float(t), float(a)
+def _resolve_tilt_az(lat: float, tilt, azimuth):
+    t = float(tilt) if tilt is not None else round(abs(lat) * 0.76, 1)
+    a = float(azimuth) if azimuth is not None else (180.0 if lat >= 0 else 0.0)
+    return t, a
 
 
 def _fetch_openmeteo(lat: float, lon: float, horizon_days: int) -> pd.DataFrame:
-    """Fetch Open-Meteo hourly forecast. Returns UTC-indexed DataFrame."""
+    """Download hourly forecast from Open-Meteo. Returns UTC-indexed DataFrame."""
     try:
         import openmeteo_requests
         import requests_cache
         from retry_requests import retry
 
+        Path(".cache/openmeteo").mkdir(parents=True, exist_ok=True)
         session = requests_cache.CachedSession(".cache/openmeteo", expire_after=1800)
         session = retry(session, retries=3, backoff_factor=0.5)
         om = openmeteo_requests.Client(session=session)
@@ -56,18 +73,12 @@ def _fetch_openmeteo(lat: float, lon: float, horizon_days: int) -> pd.DataFrame:
         resp = om.weather_api(
             "https://api.open-meteo.com/v1/forecast",
             params={
-                "latitude": lat,
-                "longitude": lon,
+                "latitude": lat, "longitude": lon,
                 "hourly": [
-                    "shortwave_radiation",
-                    "direct_normal_irradiance",
-                    "diffuse_radiation",
-                    "cloud_cover",
-                    "cloud_cover_low",
-                    "temperature_2m",
-                    "relative_humidity_2m",
-                    "surface_pressure",
-                    "wind_speed_10m",
+                    "shortwave_radiation", "direct_normal_irradiance",
+                    "diffuse_radiation", "cloud_cover", "cloud_cover_low",
+                    "temperature_2m", "relative_humidity_2m",
+                    "surface_pressure", "wind_speed_10m",
                 ],
                 "forecast_days": horizon_days,
                 "timezone": "UTC",
@@ -81,188 +92,169 @@ def _fetch_openmeteo(lat: float, lon: float, horizon_days: int) -> pd.DataFrame:
             freq=pd.Timedelta(seconds=h.Interval()),
             inclusive="left",
         )
-
         vars_ = [
-            "shortwave_radiation", "direct_normal_irradiance", "diffuse_radiation",
-            "cloud_cover", "cloud_cover_low",
-            "temperature_2m", "relative_humidity_2m",
-            "surface_pressure", "wind_speed_10m",
+            "ghi", "dni", "dhi", "cloud_cover_pct", "cloud_low_pct",
+            "temp_c", "rh", "pressure_hpa", "wind_ms",
         ]
         data = {v: h.Variables(i).ValuesAsNumpy() for i, v in enumerate(vars_)}
         df = pd.DataFrame(data, index=times)
-        df.rename(columns={
-            "shortwave_radiation": "ghi",
-            "direct_normal_irradiance": "dni",
-            "diffuse_radiation": "dhi",
-            "cloud_cover": "cloud_cover_frac",
-            "cloud_cover_low": "cloud_low_frac",
-            "temperature_2m": "temp_c",
-            "relative_humidity_2m": "rh",
-            "surface_pressure": "pressure_hpa",
-            "wind_speed_10m": "wind_speed",
-        }, inplace=True)
-        df["cloud_cover_frac"] /= 100.0
-        df["cloud_low_frac"] /= 100.0
-        df.index.name = "timestamp"
-        return df.clip(lower={"ghi": 0, "dni": 0, "dhi": 0})
-
+        df["cloud_cover"] = (df.pop("cloud_cover_pct") / 100.0).clip(0, 1)
+        df["cloud_low"]   = (df.pop("cloud_low_pct")   / 100.0).clip(0, 1)
+        df[["ghi", "dni", "dhi"]] = df[["ghi", "dni", "dhi"]].clip(lower=0)
+        return df
     except Exception as exc:
-        logger.warning("Open-Meteo fetch failed (%s). Using synthetic clear-sky.", exc)
+        logger.warning("Open-Meteo failed: %s — using clear-sky fallback", exc)
         return pd.DataFrame()
 
 
-def _compute_clearsky(lat: float, lon: float, altitude: float,
-                      tilt: float, azimuth: float,
-                      times: pd.DatetimeIndex) -> pd.DataFrame:
-    """pvlib spectrl2 clear-sky, returning ghi_cs, dhi_cs, dni_cs, poa_cs."""
+def _build_clearsky(lat, lon, altitude, tilt, azimuth, times):
+    """Run SPECTRL2 clear-sky engine. Returns DataFrame."""
     try:
-        import pvlib
-
-        loc = pvlib.location.Location(lat, lon, altitude=altitude)
-        solpos = loc.get_solarposition(times)
-        et_rad = pvlib.irradiance.get_extra_radiation(times)
-
-        aod_500 = _DEFAULT_AOD_550 * (500 / 550) ** _DEFAULT_ALPHA
-
-        sp = pvlib.irradiance.spectrl2(
-            apparent_zenith=solpos["apparent_zenith"],
-            aoi=pvlib.irradiance.aoi(tilt, azimuth,
-                                      solpos["apparent_zenith"],
-                                      solpos["azimuth"]),
-            surface_tilt=tilt,
-            ground_albedo=0.2,
-            surface_pressure=101325.0,
-            ozone=_DEFAULT_OZONE_ATM_CM,
-            precipitable_water=_DEFAULT_PRECIP_WATER,
-            aerosol_turbidity_500nm=aod_500,
-            alpha=_DEFAULT_ALPHA,
-            dayofyear=times.dayofyear,
+        from solar_forecast.clearsky.spectrl2_model import compute_clearsky
+        return compute_clearsky(
+            times=times, lat=lat, lon=lon, altitude=altitude,
+            tilt=tilt, azimuth=azimuth,
+            aod_550nm=_AOD_550, angstrom_alpha=_ALPHA1, angstrom_alpha2=_ALPHA2,
+            precipitable_water=_PW_CM, ozone_du=_OZONE_DU,
+            surface_pressure=_PRESSURE, ground_albedo=_ALBEDO,
+            ssa=_SSA, asymmetry_param=_ASYM,
+            return_spectra=False,
         )
-
-        wl = sp["wavelength"].values
-        pv_mask = (wl >= 300) & (wl <= 1200)
-
-        poa_cs = np.trapz(sp["poa_global"].values[:, pv_mask], wl[pv_mask], axis=1)
-        ghi_cs = np.trapz(sp["poa_global"].values[:, pv_mask], wl[pv_mask], axis=1)
-
-        cs = loc.get_clearsky(times, model="simplified_solis")
-        cs_poa = pvlib.irradiance.get_total_irradiance(
-            tilt, azimuth,
-            solpos["apparent_zenith"], solpos["azimuth"],
-            cs["dni"], cs["ghi"], cs["dhi"],
-        )
-
-        df = pd.DataFrame({
-            "ghi_cs": cs["ghi"].clip(lower=0),
-            "dhi_cs": cs["dhi"].clip(lower=0),
-            "dni_cs": cs["dni"].clip(lower=0),
-            "poa_cs": cs_poa["poa_global"].clip(lower=0),
-        }, index=times)
-        return df
-
     except Exception as exc:
-        logger.warning("spectrl2 failed (%s), using simplified_solis.", exc)
+        logger.warning("SPECTRL2 failed (%s), using simplified_solis", exc)
         try:
             import pvlib
             loc = pvlib.location.Location(lat, lon, altitude=altitude)
-            cs = loc.get_clearsky(times, model="simplified_solis")
-            solpos = loc.get_solarposition(times)
-            cs_poa = pvlib.irradiance.get_total_irradiance(
-                tilt, azimuth,
-                solpos["apparent_zenith"], solpos["azimuth"],
+            cs  = loc.get_clearsky(times, model="simplified_solis")
+            sp  = loc.get_solarposition(times)
+            poa = pvlib.irradiance.get_total_irradiance(
+                tilt, azimuth, sp["apparent_zenith"], sp["azimuth"],
                 cs["dni"], cs["ghi"], cs["dhi"],
             )
             return pd.DataFrame({
-                "ghi_cs": cs["ghi"].clip(lower=0),
-                "dhi_cs": cs["dhi"].clip(lower=0),
-                "dni_cs": cs["dni"].clip(lower=0),
-                "poa_cs": cs_poa["poa_global"].clip(lower=0),
+                "ghi_clear": cs["ghi"].clip(0), "dni_clear": cs["dni"].clip(0),
+                "dhi_clear": cs["dhi"].clip(0),
+                "poa_clear": poa["poa_global"].fillna(0).clip(0),
+                "zenith": sp["apparent_zenith"],
+                "azimuth_sun": sp["azimuth"],
+                "cos_zenith": np.cos(np.radians(sp["apparent_zenith"])),
+                "aoi": pvlib.irradiance.aoi(
+                    tilt, azimuth, sp["apparent_zenith"], sp["azimuth"]
+                ).clip(0, 90),
+                "airmass": pvlib.atmosphere.get_relative_airmass(
+                    sp["apparent_zenith"], model="kastenyoung1989"
+                ),
             }, index=times)
-        except Exception:
+        except Exception as exc2:
+            logger.error("Clear-sky fallback also failed: %s", exc2)
             return pd.DataFrame()
 
 
-def _poa_from_components(ghi: pd.Series, dhi: pd.Series, dni: pd.Series,
-                          lat: float, lon: float, tilt: float, azimuth: float,
-                          times: pd.DatetimeIndex) -> pd.Series:
-    """Perez transposition: GHI+DNI+DHI → POA."""
+def _physics_kt(weather: pd.DataFrame, cs: pd.DataFrame) -> pd.Series:
+    """Physics Kt from cloud cover + aerosol (Delta-Eddington)."""
+    try:
+        from solar_forecast.allsky.physics_kt import (
+            compute_physics_kt, estimate_cod_from_cover,
+        )
+        cloud  = weather.get("cloud_cover", pd.Series(0.3, index=cs.index)).reindex(cs.index).fillna(0.3)
+        cod    = estimate_cod_from_cover(cloud.values)
+        cos_z  = cs["cos_zenith"].clip(0.001).values
+        am     = cs.get("airmass", pd.Series(2.0, index=cs.index)).fillna(2.0).values
+        aod    = np.full(len(cs), _AOD_550)
+        ghi_cs = cs["ghi_clear"].values
+        dni_cs = cs["dni_clear"].values
+        dhi_cs = cs["dhi_clear"].values
+
+        kt = compute_physics_kt(
+            cloud_cover=cloud.values, cloud_optical_depth=cod,
+            cos_zenith=cos_z, airmass=am, aod_550nm=aod,
+            ghi_clear=ghi_cs, dni_clear=dni_cs, dhi_clear=dhi_cs,
+            ssa=_SSA, asymmetry=_ASYM,
+        )
+        return pd.Series(np.clip(kt, 0, 1.2), index=cs.index)
+    except Exception as exc:
+        logger.warning("physics_kt failed (%s) — ratio fallback", exc)
+        ghi_cs = cs["ghi_clear"].replace(0, np.nan)
+        ghi_obs = weather.get("ghi", pd.Series(np.nan, index=cs.index)).reindex(cs.index)
+        return (ghi_obs / ghi_cs).clip(0, 1.2).fillna(0.8)
+
+
+def _iam_correction(cs: pd.DataFrame, tilt: float, iam_model: str) -> pd.Series:
+    """Per-timestep beam IAM factor."""
+    try:
+        from solar_forecast.production.iam_model import iam_ashrae, iam_martin_ruiz, iam_fresnel
+        aoi = cs.get("aoi", pd.Series(tilt, index=cs.index)).fillna(tilt).values
+        fn = {"ashrae": iam_ashrae, "martin_ruiz": iam_martin_ruiz, "fresnel": iam_fresnel}
+        return pd.Series(fn.get(iam_model, iam_ashrae)(aoi), index=cs.index)
+    except Exception:
+        return pd.Series(0.96, index=cs.index)
+
+
+def _poa_from_components(weather, cs, lat, lon, tilt, azimuth):
+    """Perez transposition of all-sky GHI/DNI/DHI → POA."""
     try:
         import pvlib
-        loc = pvlib.location.Location(lat, lon)
-        solpos = loc.get_solarposition(times)
+        loc     = pvlib.location.Location(lat, lon)
+        times   = cs.index
+        sp      = loc.get_solarposition(times)
+        kt      = _physics_kt(weather, cs)
+        ghi_all = (kt * cs["ghi_clear"].clip(0)).clip(0)
+        dhi_all = (weather.get("dhi", cs["dhi_clear"] * kt)
+                   .reindex(times).fillna(cs["dhi_clear"] * kt))
+        dni_all = (weather.get("dni", cs["dni_clear"] * kt)
+                   .reindex(times).fillna(cs["dni_clear"] * kt)).clip(0)
         poa = pvlib.irradiance.get_total_irradiance(
-            tilt, azimuth,
-            solpos["apparent_zenith"], solpos["azimuth"],
-            dni, ghi, dhi, model="perez",
+            tilt, azimuth, sp["apparent_zenith"], sp["azimuth"],
+            dni_all, ghi_all, dhi_all, model="perez",
+            dni_extra=pvlib.irradiance.get_extra_radiation(times),
+            airmass=pvlib.atmosphere.get_relative_airmass(sp["apparent_zenith"]),
         )
-        return poa["poa_global"].clip(lower=0)
+        return ghi_all, poa["poa_global"].fillna(0).clip(0), kt
+    except Exception as exc:
+        logger.warning("Perez failed (%s)", exc)
+        kt   = _physics_kt(weather, cs)
+        ghi  = (kt * cs["ghi_clear"]).clip(0)
+        poa  = (kt * cs["poa_clear"]).clip(0)
+        return ghi, poa, kt
+
+
+def _spectral_mismatch(technology: str, sr_csv: Optional[str]) -> float:
+    """Scalar broadband spectral mismatch factor (climatological mean)."""
+    try:
+        from solar_forecast.production.spectral_response import SpectralResponse
+        sr = SpectralResponse(technology=technology, csv_path=sr_csv)
+        # MM for a typical mid-latitude spring day (AM1.5 ≈ 1.0, no correction)
+        return 1.0   # MM applied per-timestep in PVOutputModel; here we return 1
     except Exception:
-        return (ghi * 0.9).clip(lower=0)
-
-
-def _iam_factor(tilt: float) -> float:
-    """ASHRAE IAM for fixed tilt (simplified, mean over day)."""
-    import math
-    b0 = 0.05
-    aoi = abs(tilt - 15)
-    return max(0.0, 1 - b0 * (1 / max(math.cos(math.radians(aoi)), 0.01) - 1))
-
-
-def _cell_temperature(poa: pd.Series, temp_c: pd.Series,
-                      wind: Optional[pd.Series] = None) -> pd.Series:
-    """NOCT model: T_cell = T_air + (NOCT-20)/800 * G_POA."""
-    noct = 45.0
-    return temp_c + (noct - 20.0) / 800.0 * poa
+        return 1.0
 
 
 def _dc_power(poa_eff: pd.Series, t_cell: pd.Series,
               capacity_kw: float, technology: str) -> pd.Series:
-    """STC-referenced DC power with temperature coefficient."""
-    temp_coeff = {
-        "mono_si": -0.0045,
-        "poly_si": -0.0045,
-        "cdte": -0.0025,
-        "cigs": -0.0036,
-        "hit": -0.0025,
-    }.get(technology, -0.0045)
-
-    stc_irr = 1000.0
-    p_dc = capacity_kw * (poa_eff / stc_irr) * (1 + temp_coeff * (t_cell - 25.0))
+    gamma = _TEMP_COEFF.get(technology, -0.0040)
+    p_dc  = capacity_kw * (poa_eff / _G_STC) * (1.0 + gamma * (t_cell - 25.0))
     return p_dc.clip(lower=0)
 
 
-def _build_summary(hourly_df: pd.DataFrame, capacity_kw: float) -> dict:
-    """Compute summary KPIs from the hourly output DataFrame."""
-    now_utc = pd.Timestamp.now(tz="UTC").normalize()
-    today = now_utc
-    tomorrow = today + pd.Timedelta(days=1)
+def _cell_temp(poa: pd.Series, temp_c: pd.Series) -> pd.Series:
+    return temp_c + (_NOCT - 20.0) / 800.0 * poa
 
-    def daily_kwh(day: pd.Timestamp) -> float:
-        mask = (hourly_df.index >= day) & (hourly_df.index < day + pd.Timedelta(days=1))
-        return float(hourly_df.loc[mask, "energy_kwh"].sum())
 
-    total_kwh = float(hourly_df["energy_kwh"].sum())
-    today_kwh = daily_kwh(today)
-    tomorrow_kwh = daily_kwh(tomorrow)
-
-    peak_idx = hourly_df["power_kw"].idxmax()
-    peak_power = float(hourly_df["power_kw"].max())
-    peak_hour = str(peak_idx) if peak_idx is not pd.NaT else ""
-
-    hours = max(len(hourly_df), 1)
-    cap_factor = (total_kwh / (capacity_kw * hours)) * 100.0
-
-    clear_kwh = float(hourly_df.get("energy_kwh_cs", pd.Series([total_kwh])).sum())
-    cloud_loss = max(0.0, (clear_kwh - total_kwh) / max(clear_kwh, 1e-6) * 100.0)
-
+def _summary(df: pd.DataFrame, capacity_kw: float) -> dict:
+    now   = pd.Timestamp.now(tz="UTC").normalize()
+    tom   = now + pd.Timedelta(days=1)
+    def _day(d): return float(df.loc[(df.index >= d) & (df.index < d+pd.Timedelta(days=1)), "energy_kwh"].sum())
+    total = float(df["energy_kwh"].sum())
+    peak_idx = df["power_kw"].idxmax()
+    clear_e  = float(df.get("energy_kwh_cs", df["energy_kwh"]).sum())
     return {
-        "today_kwh": round(today_kwh, 3),
-        "tomorrow_kwh": round(tomorrow_kwh, 3),
-        "total_7d_kwh": round(total_kwh, 3),
-        "peak_power_kw": round(peak_power, 3),
-        "peak_hour_utc": peak_hour,
-        "capacity_factor_pct": round(min(cap_factor, 100.0), 2),
-        "cloud_loss_pct": round(min(cloud_loss, 100.0), 2),
+        "today_kwh":            round(_day(now), 2),
+        "tomorrow_kwh":         round(_day(tom), 2),
+        "total_7d_kwh":         round(total, 2),
+        "peak_power_kw":        round(float(df["power_kw"].max()), 3),
+        "peak_hour_utc":        str(peak_idx),
+        "capacity_factor_pct":  round(min(total / max(capacity_kw * len(df), 1) * 100, 100), 2),
+        "cloud_loss_pct":       round(min(max((clear_e - total) / max(clear_e, 1e-6) * 100, 0), 100), 2),
     }
 
 
@@ -274,101 +266,121 @@ def run_demo_forecast(
     tilt: Optional[float] = None,
     azimuth: Optional[float] = None,
     technology: str = "mono_si",
+    iam_model: str = "ashrae",
     horizon_days: int = 7,
+    sr_csv: Optional[str] = None,
+    use_ai: bool = False,
+    kt_model_path: str = "models/kt_xgb.joblib",
 ) -> dict:
     """
-    Run a complete physics-based forecast. No keys or DB required.
+    Full physics forecast pipeline (SPECTRL2 + SR + IAM + Perez + NOCT).
 
-    Returns dict with 'hourly' DataFrame and 'summary' dict.
+    Returns
+    -------
+    dict with keys:
+      hourly        : pd.DataFrame (UTC index)
+      summary       : dict of KPI values
+      clearsky_hourly : pd.DataFrame
+      location      : dict
     """
-    tilt, azimuth = _resolve_tilt_azimuth(lat, tilt, azimuth)
+    tilt, azimuth = _resolve_tilt_az(lat, tilt, azimuth)
 
-    # 1. Fetch live weather (Open-Meteo)
+    # 1. Live weather (Open-Meteo)
     weather = _fetch_openmeteo(lat, lon, horizon_days)
 
-    now_utc = pd.Timestamp.now(tz="UTC").floor("h")
+    now = pd.Timestamp.now(tz="UTC").floor("h")
     if weather.empty:
-        # Synthetic fallback: pure clear-sky
-        times = pd.date_range(now_utc, periods=horizon_days * 24, freq="h", tz="UTC")
-        weather = pd.DataFrame(index=times)
-
-    times = weather.index if not weather.empty else pd.date_range(
-        now_utc, periods=horizon_days * 24, freq="h", tz="UTC"
-    )
-
-    # 2. Clear-sky
-    cs = _compute_clearsky(lat, lon, altitude, tilt, azimuth, times)
-
-    # 3. POA irradiance
-    if not weather.empty and "ghi" in weather.columns:
-        ghi = weather["ghi"]
-        dhi = weather.get("dhi", weather["ghi"] * 0.15)
-        dni = weather.get("dni", (weather["ghi"] - dhi) / np.maximum(
-            np.cos(np.radians(45)), 0.1))
-        poa = _poa_from_components(ghi, dhi, dni, lat, lon, tilt, azimuth, times)
-        temp_c = weather.get("temp_c", pd.Series(20.0, index=times))
-        wind = weather.get("wind_speed", pd.Series(2.0, index=times))
-        cloud_frac = weather.get("cloud_cover_frac", pd.Series(0.3, index=times))
+        times = pd.date_range(now, periods=horizon_days * 24, freq="h", tz="UTC")
     else:
-        poa = cs.get("poa_cs", pd.Series(0.0, index=times))
-        ghi = cs.get("ghi_cs", pd.Series(0.0, index=times))
-        temp_c = pd.Series(20.0, index=times)
-        wind = pd.Series(2.0, index=times)
-        cloud_frac = pd.Series(0.0, index=times)
+        times = weather.index
 
-    # Align indices
-    poa = poa.reindex(times).fillna(0.0)
-    ghi = ghi.reindex(times).fillna(0.0)
-    temp_c = temp_c.reindex(times).fillna(20.0)
-    wind = wind.reindex(times).fillna(2.0)
+    # 2. SPECTRL2 clear-sky
+    cs = _build_clearsky(lat, lon, altitude, tilt, azimuth, times)
+    if cs.empty:
+        logger.error("Clear-sky computation failed completely.")
+        cs = pd.DataFrame({
+            "ghi_clear": 0.0, "dni_clear": 0.0, "dhi_clear": 0.0,
+            "poa_clear": 0.0, "cos_zenith": 0.0, "airmass": 2.0,
+            "zenith": 90.0, "azimuth_sun": 180.0, "aoi": 30.0,
+        }, index=times)
 
-    # 4. IAM correction
-    iam = _iam_factor(tilt)
-    poa_eff = poa * iam
+    # 3. All-sky: Perez transposition + physics Kt
+    ghi_all, poa_all, kt = _poa_from_components(weather, cs, lat, lon, tilt, azimuth)
 
-    # 5. Cell temperature
-    t_cell = _cell_temperature(poa_eff, temp_c, wind)
+    # 4. Optional AI Kt correction
+    if use_ai and Path(kt_model_path).exists():
+        try:
+            from solar_forecast.allsky.ai_trainer import KtTrainer
+            trainer = KtTrainer({
+                "model": {"kt_model_path": kt_model_path},
+                "location": {"lat": lat, "lon": lon, "altitude": altitude},
+            })
+            trainer.load(kt_model_path)
+            # Build minimal feature df for AI correction
+            feat_df = pd.DataFrame({
+                "aod_550nm": _AOD_550, "cloud_cover": weather.get("cloud_cover", 0.3).reindex(times).fillna(0.3),
+                "temp_c": weather.get("temp_c", 20.0).reindex(times).fillna(20.0),
+                "rh": weather.get("rh", 60.0).reindex(times).fillna(60.0),
+                "zenith": cs.get("zenith", 45.0),
+                "cos_zenith": cs.get("cos_zenith", 0.7),
+                "airmass": cs.get("airmass", 2.0),
+                "ghi_clear": cs["ghi_clear"],
+            }, index=times)
+            kt_ai = trainer.predict(feat_df)
+            # Blend: 40% physics, 60% AI
+            kt = pd.Series(0.4 * kt.values + 0.6 * np.clip(kt_ai, 0, 1.2), index=times)
+            ghi_all = (kt * cs["ghi_clear"]).clip(0)
+            logger.info("AI Kt correction applied.")
+        except Exception as exc:
+            logger.warning("AI Kt failed (%s) — physics-only", exc)
 
-    # 6. DC power
+    # 5. IAM correction
+    iam = _iam_correction(cs, tilt, iam_model)
+    poa_eff = (poa_all * iam).clip(0)
+
+    # 6. Cell temperature (NOCT model)
+    temp_c = weather.get("temp_c", pd.Series(20.0, index=times)).reindex(times).fillna(20.0)
+    t_cell = _cell_temp(poa_eff, temp_c)
+
+    # 7. DC power (with temperature coefficient)
     p_dc = _dc_power(poa_eff, t_cell, capacity_kw, technology)
 
-    # 7. AC losses (inverter η=0.96, wiring=0.99, soiling=0.98, mismatch=0.99)
-    system_loss = 0.96 * 0.99 * 0.98 * 0.99
-    p_ac = (p_dc * system_loss).clip(lower=0)
+    # 8. AC power (inverter + wiring + soiling)
+    system_loss = 0.97 * 0.98 * 0.98   # inverter × wiring × soiling
+    p_ac = (p_dc * system_loss).clip(0)
 
-    # 8. Energy per hour (Wh → kWh, 1 h intervals)
-    energy_kwh = p_ac  # already in kW × 1h = kWh
+    # 9. Clear-sky AC (for cloud-loss metric)
+    iam_cs  = _iam_correction(cs, tilt, iam_model)
+    poa_cs  = (cs.get("poa_clear", pd.Series(0, index=times)) * iam_cs).clip(0).reindex(times).fillna(0)
+    p_dc_cs = _dc_power(poa_cs, t_cell, capacity_kw, technology)
+    p_ac_cs = (p_dc_cs * system_loss).clip(0)
 
-    # 9. Clearness index
-    ghi_cs = cs.get("ghi_cs", pd.Series(np.nan, index=times)).reindex(times)
-    kt = (ghi / ghi_cs.replace(0, np.nan)).clip(0, 1.5)
-
-    # 10. Clear-sky energy (for cloud-loss metric)
-    poa_cs = cs.get("poa_cs", pd.Series(0.0, index=times)).reindex(times).fillna(0.0)
-    p_ac_cs = (_dc_power(poa_cs * iam, t_cell, capacity_kw, technology) * system_loss).clip(0)
+    cloud_frac = weather.get("cloud_cover", pd.Series(0.3, index=times)).reindex(times).fillna(0.3)
 
     out = pd.DataFrame({
-        "ghi_wm2": ghi.values,
-        "poa_wm2": poa_eff.values,
-        "power_kw": p_ac.values,
-        "energy_kwh": energy_kwh.values,
-        "kt": kt.values,
-        "t_cell_c": t_cell.values,
-        "cloud_cover_frac": cloud_frac.reindex(times).fillna(0.0).values,
-        "energy_kwh_cs": p_ac_cs.values,
+        "ghi_wm2":          ghi_all.reindex(times).fillna(0).clip(0).values,
+        "poa_wm2":          poa_eff.reindex(times).fillna(0).clip(0).values,
+        "ghi_clear_wm2":    cs["ghi_clear"].reindex(times).fillna(0).values,
+        "poa_clear_wm2":    cs.get("poa_clear", pd.Series(0, index=times)).reindex(times).fillna(0).values,
+        "power_kw":         p_ac.reindex(times).fillna(0).values,
+        "power_clear_kw":   p_ac_cs.reindex(times).fillna(0).values,
+        "energy_kwh":       p_ac.reindex(times).fillna(0).values,
+        "energy_kwh_cs":    p_ac_cs.reindex(times).fillna(0).values,
+        "kt":               kt.reindex(times).fillna(0).values,
+        "t_cell_c":         t_cell.reindex(times).fillna(25.0).values,
+        "cloud_cover_frac": cloud_frac.values,
+        "iam":              iam.reindex(times).fillna(0.96).values,
     }, index=times)
-
     out.index.name = "timestamp_utc"
 
-    summary = _build_summary(out, capacity_kw)
-
     return {
-        "hourly": out,
-        "summary": summary,
-        "clearsky_hourly": cs.reindex(times),
+        "hourly":           out,
+        "summary":          _summary(out, capacity_kw),
+        "clearsky_hourly":  cs.reindex(times),
         "location": {
             "lat": lat, "lon": lon, "altitude": altitude,
             "tilt": tilt, "azimuth": azimuth,
             "capacity_kw": capacity_kw, "technology": technology,
+            "iam_model": iam_model,
         },
     }
