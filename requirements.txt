@@ -1,39 +1,49 @@
-# Core scientific stack
+# ── Core scientific stack ──────────────────────────────────────────────────
 numpy>=1.24.0
 scipy>=1.11.0
 pandas>=2.0.0
 
-# Solar modeling
+# ── Solar modeling ─────────────────────────────────────────────────────────
 pvlib>=0.10.5
 
-# Machine learning
+# ── Machine learning (optional — XGBoost Kt model) ────────────────────────
 xgboost>=2.0.0
 scikit-learn>=1.3.0
 joblib>=1.3.0
 
-# Database
+# ── Database ───────────────────────────────────────────────────────────────
 sqlalchemy>=2.0.0
-psycopg2-binary>=2.9.0
+psycopg2-binary>=2.9.0      # optional — only needed for CAMS training DB
 
-# CAMS / Copernicus data
+# ── CAMS / Copernicus data (optional) ─────────────────────────────────────
 cdsapi>=0.6.0
 xarray>=2023.6.0
 netCDF4>=1.6.0
 
-# Live weather
+# ── Live weather (free, no key) ────────────────────────────────────────────
 openmeteo-requests>=1.2.0
 requests-cache>=1.1.0
 retry-requests>=2.0.0
 requests>=2.31.0
 
-# Dashboard
+# ── Web dashboard ──────────────────────────────────────────────────────────
 streamlit>=1.30.0
 streamlit-autorefresh>=1.0.1
 plotly>=5.18.0
 
-# Config & utils
+# ── REST API backend ───────────────────────────────────────────────────────
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.0.0
+
+# ── Config & utilities ─────────────────────────────────────────────────────
 pyyaml>=6.0
 python-dotenv>=1.0.0
 click>=8.1.0
 tqdm>=4.66.0
 pytz>=2023.3
+
+# ── Testing ────────────────────────────────────────────────────────────────
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+httpx>=0.27.0
