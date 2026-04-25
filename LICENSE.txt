@@ -1,0 +1,40 @@
+Regular License — CodeCanyon / Envato Market
+============================================
+
+This license grants you, the purchaser, an ongoing, non-exclusive,
+worldwide license to make use of the digital work (Item) you have
+purchased. Read the full license terms at:
+https://codecanyon.net/licenses/standard
+
+Item: AI Solar Production Forecast SaaS
+Author: Solar Forecast Pro
+Version: 2.0.0
+
+--------------------------------------------------------------------
+
+You are licensed to use the Item to create ONE End Product for
+yourself or for one client (a "single application"). The End Product
+can be a Free End Product or a Paid End Product.
+
+An End Product is one unique website or web application.
+
+You are NOT allowed to:
+  - Redistribute or resell the Item as-is or in modified form.
+  - Make the Item available as a template, theme, or product for others.
+  - Use the Item to create more than one End Product.
+
+For multi-site or SaaS deployments serving paying end-users, you need
+an Extended License.
+
+--------------------------------------------------------------------
+
+The above license summary is informational only. The full binding
+license is at https://codecanyon.net/licenses/standard
+
+Third-party components are subject to their own licenses:
+  - pvlib: BSD 3-Clause
+  - XGBoost: Apache 2.0
+  - FastAPI: MIT
+  - Streamlit: Apache 2.0
+  - Open-Meteo: CC BY 4.0 (non-commercial free tier)
+  - Pandas / NumPy / SciPy: BSD 3-Clause

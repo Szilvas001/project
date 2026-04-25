@@ -1,0 +1,88 @@
+version: "3.9"
+
+services:
+  # ── Streamlit Dashboard ────────────────────────────────────────────────
+  dashboard:
+    build: .
+    image: solar-forecast-pro:latest
+    container_name: solar_forecast_dashboard
+    command: streamlit run solar_forecast/dashboard/app.py
+      --server.port 8501
+      --server.address 0.0.0.0
+      --server.headless true
+      --theme.base dark
+      --theme.primaryColor "#F4A503"
+      --theme.backgroundColor "#0E1117"
+      --theme.secondaryBackgroundColor "#1E1E2E"
+      --theme.textColor "#FAFAFA"
+    ports:
+      - "8501:8501"
+    volumes:
+      - solar_data:/app/data
+      - solar_models:/app/models
+      - solar_cache:/app/.cache
+    environment:
+      - CAMS_API_KEY=${CAMS_API_KEY:-}
+      - PGHOST=${PGHOST:-}
+      - PGDATABASE=${PGDATABASE:-}
+      - PGUSER=${PGUSER:-}
+      - PGPASSWORD=${PGPASSWORD:-}
+      - DEMO_MODE=${DEMO_MODE:-true}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── FastAPI Backend ────────────────────────────────────────────────────
+  api:
+    build: .
+    image: solar-forecast-pro:latest
+    container_name: solar_forecast_api
+    command: uvicorn app.api.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - solar_data:/app/data
+      - solar_models:/app/models
+      - solar_cache:/app/.cache
+    environment:
+      - CAMS_API_KEY=${CAMS_API_KEY:-}
+      - PGHOST=${PGHOST:-}
+      - PGDATABASE=${PGDATABASE:-}
+      - PGUSER=${PGUSER:-}
+      - PGPASSWORD=${PGPASSWORD:-}
+      - DEMO_MODE=${DEMO_MODE:-true}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── PostgreSQL (optional — only needed for CAMS training) ──────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: solar_forecast_postgres
+    profiles: ["training"]
+    environment:
+      POSTGRES_DB: ${PGDATABASE:-solar_forecast}
+      POSTGRES_USER: ${PGUSER:-solar}
+      POSTGRES_PASSWORD: ${PGPASSWORD:-solar_secret}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PGUSER:-solar}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  solar_data:
+  solar_models:
+  solar_cache:
+  pg_data:
