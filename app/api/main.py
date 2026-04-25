@@ -12,7 +12,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import health, locations, forecast
-from app.db.sqlite_manager import create_tables, seed_demo_location
+from app.db.sqlite_manager import create_tables, migrate_schema, seed_demo_location
 
 app = FastAPI(
     title="Solar Forecast Pro",
@@ -38,4 +38,5 @@ app.include_router(forecast.router)
 @app.on_event("startup")
 def startup():
     create_tables()
+    migrate_schema()
     seed_demo_location()

@@ -45,18 +45,24 @@ def create_tables() -> None:
     with _conn() as con:
         con.executescript("""
         CREATE TABLE IF NOT EXISTS locations (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            name        TEXT NOT NULL,
-            lat         REAL NOT NULL,
-            lon         REAL NOT NULL,
-            altitude    REAL NOT NULL DEFAULT 0.0,
-            capacity_kw REAL NOT NULL DEFAULT 5.0,
-            tilt        REAL,
-            azimuth     REAL,
-            technology  TEXT NOT NULL DEFAULT 'mono_si',
-            timezone    TEXT NOT NULL DEFAULT 'UTC',
-            created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-            updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            name                 TEXT NOT NULL,
+            lat                  REAL NOT NULL,
+            lon                  REAL NOT NULL,
+            altitude             REAL NOT NULL DEFAULT 0.0,
+            capacity_kw          REAL NOT NULL DEFAULT 5.0,
+            tilt                 REAL,
+            azimuth              REAL,
+            technology           TEXT NOT NULL DEFAULT 'mono_si',
+            timezone             TEXT NOT NULL DEFAULT 'UTC',
+            electricity_price    REAL NOT NULL DEFAULT 0.12,
+            feedin_tariff        REAL NOT NULL DEFAULT 0.06,
+            system_cost_eur      REAL,
+            self_consumption_pct REAL NOT NULL DEFAULT 30.0,
+            iam_model            TEXT NOT NULL DEFAULT 'ashrae',
+            notes                TEXT,
+            created_at           TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at           TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
         CREATE TABLE IF NOT EXISTS forecasts (
@@ -97,7 +103,9 @@ def create_location(data: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"Missing required fields: {missing}")
 
     cols = ["name", "lat", "lon", "altitude", "capacity_kw",
-            "tilt", "azimuth", "technology", "timezone"]
+            "tilt", "azimuth", "technology", "timezone",
+            "electricity_price", "feedin_tariff", "system_cost_eur",
+            "self_consumption_pct", "iam_model", "notes"]
     vals = [
         str(data["name"]),
         float(data["lat"]),
@@ -108,6 +116,12 @@ def create_location(data: dict[str, Any]) -> dict[str, Any]:
         float(data["azimuth"]) if data.get("azimuth") is not None else None,
         str(data.get("technology", "mono_si")),
         str(data.get("timezone", "UTC")),
+        float(data.get("electricity_price", 0.12)),
+        float(data.get("feedin_tariff", 0.06)),
+        float(data["system_cost_eur"]) if data.get("system_cost_eur") is not None else None,
+        float(data.get("self_consumption_pct", 30.0)),
+        str(data.get("iam_model", "ashrae")),
+        str(data["notes"]) if data.get("notes") else None,
     ]
     with _conn() as con:
         cur = con.execute(
@@ -119,7 +133,9 @@ def create_location(data: dict[str, Any]) -> dict[str, Any]:
 
 def update_location(location_id: int, data: dict[str, Any]) -> Optional[dict[str, Any]]:
     allowed = {"name", "lat", "lon", "altitude", "capacity_kw",
-               "tilt", "azimuth", "technology", "timezone"}
+               "tilt", "azimuth", "technology", "timezone",
+               "electricity_price", "feedin_tariff", "system_cost_eur",
+               "self_consumption_pct", "iam_model", "notes"}
     updates = {k: v for k, v in data.items() if k in allowed}
     if not updates:
         return get_location(location_id)
@@ -172,14 +188,43 @@ def load_forecast(location_id: int, forecast_date: str) -> Optional[dict]:
         }
 
 
+def migrate_schema() -> None:
+    """Add new columns to existing locations table (safe to run repeatedly)."""
+    new_cols = [
+        ("electricity_price",    "REAL NOT NULL DEFAULT 0.12"),
+        ("feedin_tariff",        "REAL NOT NULL DEFAULT 0.06"),
+        ("system_cost_eur",      "REAL"),
+        ("self_consumption_pct", "REAL NOT NULL DEFAULT 30.0"),
+        ("iam_model",            "TEXT NOT NULL DEFAULT 'ashrae'"),
+        ("notes",                "TEXT"),
+    ]
+    with _conn() as con:
+        existing = {row[1] for row in con.execute("PRAGMA table_info(locations)").fetchall()}
+        for col, defn in new_cols:
+            if col not in existing:
+                con.execute(f"ALTER TABLE locations ADD COLUMN {col} {defn}")
+
+
 def seed_demo_location() -> None:
-    """Insert a Budapest demo location if the table is empty."""
+    """Insert Budapest + Vienna demo locations if the table is empty."""
     with _conn() as con:
         count = con.execute("SELECT COUNT(*) FROM locations").fetchone()[0]
         if count == 0:
             con.execute("""
             INSERT INTO locations (name, lat, lon, altitude, capacity_kw,
-                                   tilt, azimuth, technology, timezone)
-            VALUES ('Budapest Demo', 47.4979, 19.0402, 120.0, 5.0,
-                    36.0, 180.0, 'mono_si', 'Europe/Budapest')
+                                   tilt, azimuth, technology, timezone,
+                                   electricity_price, feedin_tariff,
+                                   system_cost_eur, self_consumption_pct)
+            VALUES ('Budapest — Residential', 47.4979, 19.0402, 120.0, 5.0,
+                    36.0, 180.0, 'mono_si', 'Europe/Budapest',
+                    0.13, 0.06, 4500.0, 35.0)
+            """)
+            con.execute("""
+            INSERT INTO locations (name, lat, lon, altitude, capacity_kw,
+                                   tilt, azimuth, technology, timezone,
+                                   electricity_price, feedin_tariff,
+                                   system_cost_eur, self_consumption_pct)
+            VALUES ('Vienna — Office Park', 48.2082, 16.3738, 180.0, 12.0,
+                    30.0, 180.0, 'poly_si', 'Europe/Vienna',
+                    0.15, 0.07, 10800.0, 25.0)
             """)
