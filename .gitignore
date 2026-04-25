@@ -17,9 +17,12 @@ venv/
 .openmeteo_cache*
 *.cache
 
-# Trained models (large binaries; distribute separately)
-models/*.joblib
-models/*.pkl
+# Trained models — production models excluded; demo model included via git-lfs or directly
+# Uncomment to exclude model files from repo:
+# models/*.joblib
+# models/*.pkl
+data/
+.cache/
 
 # Data files
 *.nc
