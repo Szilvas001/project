@@ -195,8 +195,8 @@ class SpectralResponse:
         am15_wl   = _AM15G[:, 0]
         am15_irr  = _AM15G[:, 1]
         am15_on_sr = np.interp(self._wl, am15_wl, am15_irr, left=0.0, right=0.0)
-        self._am15_sr_integral = np.trapz(self._sr * am15_on_sr, self._wl)
-        self._am15_total       = np.trapz(am15_on_sr, self._wl)
+        self._am15_sr_integral = np.trapezoid(self._sr * am15_on_sr, self._wl)
+        self._am15_total       = np.trapezoid(am15_on_sr, self._wl)
 
     @property
     def name(self) -> str:
@@ -248,8 +248,8 @@ class SpectralResponse:
         # Interpolate onto SR wavelength grid
         g_sr = np.interp(self._wl, wl_in, g_in, left=0.0, right=0.0)
 
-        sr_integral = np.trapz(self._sr * g_sr, self._wl)
-        g_total     = np.trapz(g_sr, self._wl)
+        sr_integral = np.trapezoid(self._sr * g_sr, self._wl)
+        g_total     = np.trapezoid(g_sr, self._wl)
 
         if self._am15_sr_integral < 1e-6 or sr_integral < 1e-6 or g_total < 1e-6:
             return 1.0
@@ -273,7 +273,7 @@ class SpectralResponse:
         g_in  = np.asarray(spectral_irradiance[g_key])
 
         g_sr = np.interp(self._wl, wl_in, g_in, left=0.0, right=0.0)
-        sr_integral = np.trapz(self._sr * g_sr, self._wl)
+        sr_integral = np.trapezoid(self._sr * g_sr, self._wl)
 
         if self._am15_sr_integral < 1e-6 or sr_integral < 1e-6:
             return 1.0
@@ -300,6 +300,86 @@ class SpectralResponse:
             else:
                 mm.append(self.mismatch_factor(sp))
         return np.array(mm, dtype=float)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Atmospheric-perturbation spectral factor (per-timestep, fast)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def spectral_factor_series(
+        self,
+        airmass: np.ndarray,
+        precipitable_water_cm: float | np.ndarray = 1.5,
+        cloud_cover: float | np.ndarray | None = None,
+    ) -> np.ndarray:
+        """
+        Per-timestep spectral mismatch factor MM(t) without a full SPECTRL2
+        spectrum at every step.
+
+        Builds an approximate atmospheric spectrum from the AM1.5G reference
+        by Beer-Lambert attenuation with airmass-scaled Rayleigh + H₂O bands,
+        then integrates SR against it. Different SR curves react differently
+        to the same atmospheric state — so panel technology and custom SR
+        uploads produce measurably different effective irradiance.
+
+        Parameters
+        ----------
+        airmass : array-like, shape (n,)
+            Relative airmass per timestep.
+        precipitable_water_cm : scalar or array
+            Column water vapor (default 1.5 cm).
+        cloud_cover : scalar or array or None
+            Optional 0–1 cloud cover. Diffuses the spectrum (slight blue boost).
+
+        Returns
+        -------
+        mm : np.ndarray, shape (n,) — clipped to [0.85, 1.15] for stability.
+        """
+        am = np.asarray(airmass, dtype=float)
+        n  = len(am)
+        pw = np.full(n, float(precipitable_water_cm)) if np.isscalar(precipitable_water_cm) \
+             else np.asarray(precipitable_water_cm, dtype=float)
+        cc = np.zeros(n) if cloud_cover is None else (
+            np.full(n, float(cloud_cover)) if np.isscalar(cloud_cover)
+            else np.asarray(cloud_cover, dtype=float)
+        )
+
+        # Wavelength-resolved optical-depth components on the SR grid
+        wl_um  = self._wl / 1000.0
+        tau_R  = 0.008569 * wl_um ** (-4.08)            # Rayleigh (Bird 1986)
+        # H2O absorption bands (Gaussian envelopes around 940/1130/1380 nm)
+        a_h2o = (
+            0.040 * np.exp(-((self._wl -  940) ** 2) / (2 *  30 ** 2)) +
+            0.030 * np.exp(-((self._wl - 1130) ** 2) / (2 *  50 ** 2)) +
+            0.500 * np.exp(-((self._wl - 1380) ** 2) / (2 *  80 ** 2))
+        )
+
+        # AM1.5G on SR grid
+        am15_wl   = _AM15G[:, 0]
+        am15_irr  = _AM15G[:, 1]
+        am15_on_sr = np.interp(self._wl, am15_wl, am15_irr, left=0.0, right=0.0)
+
+        out = np.ones(n)
+        for i in range(n):
+            a_i = am[i]
+            if not np.isfinite(a_i) or a_i < 1.0:
+                continue
+            delta = a_i - 1.5  # relative to AM1.5G
+            atten = np.exp(-(tau_R + a_h2o * pw[i] / 1.5) * delta)
+            spec  = am15_on_sr * atten
+            # Cloud cover slightly blue-shifts the diffuse component:
+            # mix in a Rayleigh-weighted spectrum (∝ 1/λ⁴) at fraction cc[i]
+            if cc[i] > 0:
+                blue = am15_on_sr * (1.0 / wl_um ** 4)
+                blue = blue * (np.trapezoid(spec, self._wl) / max(np.trapezoid(blue, self._wl), 1e-9))
+                spec = (1.0 - 0.30 * cc[i]) * spec + (0.30 * cc[i]) * blue
+
+            sr_int = np.trapezoid(self._sr * spec, self._wl)
+            g_int  = np.trapezoid(spec, self._wl)
+            if sr_int < 1e-9 or g_int < 1e-9:
+                continue
+            out[i] = (sr_int / self._am15_sr_integral) / (g_int / self._am15_total)
+
+        return np.clip(out, 0.85, 1.15)
 
     # ──────────────────────────────────────────────────────────────────────
     # CSV loading

@@ -130,6 +130,7 @@ def compute_clearsky(
         alpha_eff = 0.5 * (a1 + a2)
 
         try:
+            # pvlib >=0.10 spectrl2 signature
             sp = spectrl2(
                 apparent_zenith=sza,
                 aoi=float(np.clip(aoi_arr[i], 0.0, 90.0)),
@@ -139,11 +140,11 @@ def compute_clearsky(
                 relative_airmass=am_rel,
                 precipitable_water=float(pw_arr[i]),
                 ozone=float(oz_arr[i]),
-                aerosol_turbidity=aod_500,
+                aerosol_turbidity_500nm=aod_500,
                 dayofyear=int(times[i].dayofyear),
-                scattering_albedo=float(np.clip(ssa_arr[i], 0.5, 1.0)),
-                asymmetry_parameter=float(np.clip(g_arr[i], 0.3, 0.9)),
-                aerosol_angstrom_exponent=alpha_eff,
+                scattering_albedo_400nm=float(np.clip(ssa_arr[i], 0.5, 1.0)),
+                aerosol_asymmetry_factor=float(np.clip(g_arr[i], 0.3, 0.9)),
+                alpha=alpha_eff,
             )
         except Exception as exc:
             logger.debug("spectrl2 step %d (sza=%.1f°): %s", i, sza, exc)
@@ -161,7 +162,7 @@ def compute_clearsky(
         mask_pv   = (wl >= _PV_WL_MIN) & (wl <= _PV_WL_MAX)
 
         def _integrate(arr, mask):
-            return max(0.0, float(np.trapz(arr[mask], wl[mask])))
+            return max(0.0, float(np.trapezoid(arr[mask], wl[mask])))
 
         dni_clear = _integrate(dni_spec, mask_full)
         dhi_clear = _integrate(dhi_spec, mask_full)

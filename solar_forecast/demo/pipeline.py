@@ -221,15 +221,36 @@ def _poa_from_components(weather, cs, lat, lon, tilt, azimuth):
         return ghi, poa, kt
 
 
-def _spectral_mismatch(technology: str, sr_csv: Optional[str]) -> float:
-    """Scalar broadband spectral mismatch factor (climatological mean)."""
+def _spectral_factor_series(
+    technology: str,
+    sr_csv: Optional[str],
+    airmass: np.ndarray,
+    cloud_cover: np.ndarray,
+    pw_cm: float = _PW_CM,
+) -> np.ndarray:
+    """
+    Per-timestep spectral mismatch factor MM(t).
+
+    Different SR curves (mono_si vs CdTe vs custom CSV) integrate the
+    atmospheric spectrum differently — so the returned series is genuinely
+    technology-dependent and a custom CSV upload is reflected in output.
+    """
     try:
         from solar_forecast.production.spectral_response import SpectralResponse
         sr = SpectralResponse(technology=technology, csv_path=sr_csv)
-        # MM for a typical mid-latitude spring day (AM1.5 ≈ 1.0, no correction)
-        return 1.0   # MM applied per-timestep in PVOutputModel; here we return 1
-    except Exception:
-        return 1.0
+        return sr.spectral_factor_series(
+            airmass=airmass,
+            precipitable_water_cm=pw_cm,
+            cloud_cover=cloud_cover,
+        )
+    except Exception as exc:
+        logger.warning("Spectral factor computation failed (%s) — neutral 1.0", exc)
+        return np.ones(len(airmass))
+
+
+def _spectral_mismatch(technology: str, sr_csv: Optional[str]) -> float:  # noqa: D401
+    """Backwards-compatible scalar entry — superseded by _spectral_factor_series."""
+    return 1.0
 
 
 def _dc_power(poa_eff: pd.Series, t_cell: pd.Series,
@@ -339,7 +360,17 @@ def run_demo_forecast(
 
     # 5. IAM correction
     iam = _iam_correction(cs, tilt, iam_model)
-    poa_eff = (poa_all * iam).clip(0)
+
+    # 5b. Spectral mismatch — SR(λ) integrated against atmospheric spectrum.
+    # This is what makes panel technology + custom SR CSVs visible in output.
+    am_arr     = cs.get("airmass", pd.Series(2.0, index=times)).reindex(times).fillna(2.0).values
+    cloud_arr  = weather.get("cloud_cover", pd.Series(0.3, index=times)).reindex(times).fillna(0.3).values
+    spec_factor = _spectral_factor_series(
+        technology=technology, sr_csv=sr_csv,
+        airmass=am_arr, cloud_cover=cloud_arr,
+    )
+    spec_series = pd.Series(spec_factor, index=times)
+    poa_eff = (poa_all * iam * spec_series).clip(0)
 
     # 6. Cell temperature (NOCT model)
     temp_c = weather.get("temp_c", pd.Series(20.0, index=times)).reindex(times).fillna(20.0)
@@ -352,9 +383,10 @@ def run_demo_forecast(
     system_loss = 0.97 * 0.98 * 0.98   # inverter × wiring × soiling
     p_ac = (p_dc * system_loss).clip(0)
 
-    # 9. Clear-sky AC (for cloud-loss metric)
+    # 9. Clear-sky AC (for cloud-loss metric) — uses same spectral factor at AM=1.5 baseline
     iam_cs  = _iam_correction(cs, tilt, iam_model)
-    poa_cs  = (cs.get("poa_clear", pd.Series(0, index=times)) * iam_cs).clip(0).reindex(times).fillna(0)
+    poa_cs  = (cs.get("poa_clear", pd.Series(0, index=times)) * iam_cs * spec_series).clip(0) \
+              .reindex(times).fillna(0)
     p_dc_cs = _dc_power(poa_cs, t_cell, capacity_kw, technology)
     p_ac_cs = (p_dc_cs * system_loss).clip(0)
 
@@ -373,6 +405,7 @@ def run_demo_forecast(
         "t_cell_c":         t_cell.reindex(times).fillna(25.0).values,
         "cloud_cover_frac": cloud_frac.values,
         "iam":              iam.reindex(times).fillna(0.96).values,
+        "spectral_factor":  spec_series.reindex(times).fillna(1.0).values,
     }, index=times)
     out.index.name = "timestamp_utc"
 
