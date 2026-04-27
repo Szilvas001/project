@@ -52,10 +52,13 @@ _NOCT = 45.0
 _G_STC = 1000.0
 
 
-def _resolve_tilt_az(lat: float, tilt, azimuth):
+def _resolve_tilt_azimuth(lat: float, tilt, azimuth):
     t = float(tilt) if tilt is not None else round(abs(lat) * 0.76, 1)
     a = float(azimuth) if azimuth is not None else (180.0 if lat >= 0 else 0.0)
     return t, a
+
+
+_resolve_tilt_az = _resolve_tilt_azimuth  # backwards-compatible alias
 
 
 def _fetch_openmeteo(lat: float, lon: float, horizon_days: int) -> pd.DataFrame:
@@ -283,7 +286,7 @@ def run_demo_forecast(
       clearsky_hourly : pd.DataFrame
       location      : dict
     """
-    tilt, azimuth = _resolve_tilt_az(lat, tilt, azimuth)
+    tilt, azimuth = _resolve_tilt_azimuth(lat, tilt, azimuth)
 
     # 1. Live weather (Open-Meteo)
     weather = _fetch_openmeteo(lat, lon, horizon_days)
