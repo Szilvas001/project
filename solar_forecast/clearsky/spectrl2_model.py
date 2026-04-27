@@ -153,10 +153,18 @@ def compute_clearsky(
                 spectra_list.append(None)
             continue
 
-        wl       = np.asarray(sp["wavelength"])
-        dni_spec = np.asarray(sp["dni"])
-        dhi_spec = np.asarray(sp["dhi"])
-        poa_spec = np.asarray(sp["poa_global"])
+        # pvlib >=0.10 returns 2-D arrays of shape (n_wavelengths, n_times) even
+        # for a single timestep — flatten to 1-D so the trapezoid integral works.
+        wl       = np.asarray(sp["wavelength"]).reshape(-1)
+        dni_spec = np.asarray(sp["dni"]).reshape(-1)
+        dhi_spec = np.asarray(sp["dhi"]).reshape(-1)
+        poa_spec = np.asarray(sp["poa_global"]).reshape(-1)
+        if len(dni_spec) != len(wl):
+            # Time axis present — take first column
+            n_wl = len(wl)
+            dni_spec = np.asarray(sp["dni"]).reshape(n_wl, -1)[:, 0]
+            dhi_spec = np.asarray(sp["dhi"]).reshape(n_wl, -1)[:, 0]
+            poa_spec = np.asarray(sp["poa_global"]).reshape(n_wl, -1)[:, 0]
 
         mask_full = (wl >= _WL_MIN) & (wl <= _WL_MAX)
         mask_pv   = (wl >= _PV_WL_MIN) & (wl <= _PV_WL_MAX)

@@ -264,22 +264,98 @@ def _cell_temp(poa: pd.Series, temp_c: pd.Series) -> pd.Series:
     return temp_c + (_NOCT - 20.0) / 800.0 * poa
 
 
-def _summary(df: pd.DataFrame, capacity_kw: float) -> dict:
+def _infer_timestep_hours(idx: pd.DatetimeIndex) -> float:
+    """Median spacing between samples (hours). Defaults to 1.0 for short indexes."""
+    if len(idx) < 2:
+        return 1.0
+    delta = pd.Series(idx).diff().dropna().median()
+    return float(delta.total_seconds() / 3600.0)
+
+
+def _confidence_score(
+    weather_available: bool,
+    cloud_data_available: bool,
+    ai_used: bool,
+    sr_custom: bool,
+    cams_used: bool,
+) -> tuple[float, str, list[str]]:
+    """
+    Rule-based confidence indicator with explainable reasons.
+
+    Each component contributes to a 0–100 score; the label is mapped from
+    the score with thresholds High ≥ 75, Medium ≥ 50, else Low. Reasons
+    list both the positives and the missing-input warnings so the UI can
+    explain *why* the forecast is rated as it is.
+    """
+    score = 40.0  # baseline: pure climatological physics always works
+    reasons: list[str] = []
+
+    if weather_available:
+        score += 25
+        reasons.append("Live weather forecast available")
+    else:
+        reasons.append("No live weather — climatological fallback")
+
+    if cloud_data_available:
+        score += 10
+        reasons.append("Cloud-cover data present")
+    else:
+        reasons.append("No cloud-cover data — assumed climatological mean")
+
+    if ai_used:
+        score += 15
+        reasons.append("AI Kt correction (XGBoost) applied")
+    else:
+        reasons.append("Physics-only Kt (AI model not loaded)")
+
+    if sr_custom:
+        score += 5
+        reasons.append("Custom spectral response curve in use")
+
+    if cams_used:
+        score += 5
+        reasons.append("CAMS-trained aerosol features active")
+
+    score = float(min(100.0, max(0.0, score)))
+    label = "High" if score >= 75 else ("Medium" if score >= 50 else "Low")
+    return round(score, 1), label, reasons
+
+
+def _summary(df: pd.DataFrame, capacity_kw: float, timestep_hours: float,
+             resolution: str, confidence: tuple[float, str, list[str]]) -> dict:
     now   = pd.Timestamp.now(tz="UTC").normalize()
     tom   = now + pd.Timedelta(days=1)
-    def _day(d): return float(df.loc[(df.index >= d) & (df.index < d+pd.Timedelta(days=1)), "energy_kwh"].sum())
-    total = float(df["energy_kwh"].sum())
-    peak_idx = df["power_kw"].idxmax()
-    clear_e  = float(df.get("energy_kwh_cs", df["energy_kwh"]).sum())
+
+    def _day(d):
+        return float(df.loc[(df.index >= d) & (df.index < d + pd.Timedelta(days=1)),
+                            "energy_kwh"].sum())
+
+    total       = float(df["energy_kwh"].sum())
+    peak_idx    = df["power_kw"].idxmax()
+    clear_e     = float(df.get("energy_kwh_cs", df["energy_kwh"]).sum())
+    horizon_h   = max(len(df) * timestep_hours, 1.0)
+    cap_factor  = total / (capacity_kw * horizon_h) * 100.0
+
+    conf_pct, conf_label, conf_reasons = confidence
+
     return {
         "today_kwh":            round(_day(now), 2),
         "tomorrow_kwh":         round(_day(tom), 2),
         "total_7d_kwh":         round(total, 2),
         "peak_power_kw":        round(float(df["power_kw"].max()), 3),
         "peak_hour_utc":        str(peak_idx),
-        "capacity_factor_pct":  round(min(total / max(capacity_kw * len(df), 1) * 100, 100), 2),
-        "cloud_loss_pct":       round(min(max((clear_e - total) / max(clear_e, 1e-6) * 100, 0), 100), 2),
+        "capacity_factor_pct":  round(min(cap_factor, 100.0), 2),
+        "cloud_loss_pct":       round(min(max((clear_e - total) / max(clear_e, 1e-6) * 100.0, 0), 100), 2),
+        "confidence_pct":       conf_pct,
+        "confidence_label":     conf_label,
+        "confidence_reasons":   conf_reasons,
+        "resolution":           resolution,
+        "timestep_hours":       round(timestep_hours, 4),
     }
+
+
+_RESOLUTION_FREQ = {"hourly": "h", "15min": "15min"}
+_RESOLUTION_DT_H = {"hourly": 1.0, "15min": 0.25}
 
 
 def run_demo_forecast(
@@ -294,29 +370,51 @@ def run_demo_forecast(
     horizon_days: int = 7,
     sr_csv: Optional[str] = None,
     use_ai: bool = False,
+    resolution: str = "hourly",
     kt_model_path: str = "models/kt_xgb.joblib",
 ) -> dict:
     """
     Full physics forecast pipeline (SPECTRL2 + SR + IAM + Perez + NOCT).
 
+    Parameters
+    ----------
+    resolution : 'hourly' (default) or '15min'.
+        15-min mode upsamples Open-Meteo hourly data via time-weighted
+        interpolation; the energy column is computed as
+        ``power_kw × timestep_hours`` regardless of step size.
+
     Returns
     -------
     dict with keys:
-      hourly        : pd.DataFrame (UTC index)
-      summary       : dict of KPI values
+      hourly        : pd.DataFrame (UTC index — name kept for API stability)
+      summary       : dict of KPI values + confidence + resolution
       clearsky_hourly : pd.DataFrame
       location      : dict
     """
+    if resolution not in _RESOLUTION_FREQ:
+        raise ValueError(f"resolution must be one of {list(_RESOLUTION_FREQ)}")
+
     tilt, azimuth = _resolve_tilt_azimuth(lat, tilt, azimuth)
 
-    # 1. Live weather (Open-Meteo)
+    # 1. Live weather (Open-Meteo) — always at hourly source resolution
     weather = _fetch_openmeteo(lat, lon, horizon_days)
+    weather_available    = not weather.empty
+    cloud_data_available = weather_available and "cloud_cover" in weather.columns
+
+    freq      = _RESOLUTION_FREQ[resolution]
+    timestep_hours = _RESOLUTION_DT_H[resolution]
+    n_steps   = int(horizon_days * 24 / timestep_hours)
 
     now = pd.Timestamp.now(tz="UTC").floor("h")
     if weather.empty:
-        times = pd.date_range(now, periods=horizon_days * 24, freq="h", tz="UTC")
+        times = pd.date_range(now, periods=n_steps, freq=freq, tz="UTC")
     else:
-        times = weather.index
+        # Upsample hourly weather to target grid via time-aware interpolation
+        target = pd.date_range(weather.index[0], periods=n_steps, freq=freq, tz="UTC")
+        weather = weather.reindex(weather.index.union(target)) \
+                         .interpolate(method="time", limit_direction="both") \
+                         .reindex(target)
+        times = target
 
     # 2. SPECTRL2 clear-sky
     cs = _build_clearsky(lat, lon, altitude, tilt, azimuth, times)
@@ -332,6 +430,7 @@ def run_demo_forecast(
     ghi_all, poa_all, kt = _poa_from_components(weather, cs, lat, lon, tilt, azimuth)
 
     # 4. Optional AI Kt correction
+    ai_was_applied = False
     if use_ai and Path(kt_model_path).exists():
         try:
             from solar_forecast.allsky.ai_trainer import KtTrainer
@@ -354,6 +453,7 @@ def run_demo_forecast(
             # Blend: 40% physics, 60% AI
             kt = pd.Series(0.4 * kt.values + 0.6 * np.clip(kt_ai, 0, 1.2), index=times)
             ghi_all = (kt * cs["ghi_clear"]).clip(0)
+            ai_was_applied = True
             logger.info("AI Kt correction applied.")
         except Exception as exc:
             logger.warning("AI Kt failed (%s) — physics-only", exc)
@@ -392,15 +492,19 @@ def run_demo_forecast(
 
     cloud_frac = weather.get("cloud_cover", pd.Series(0.3, index=times)).reindex(times).fillna(0.3)
 
+    p_ac_aligned    = p_ac.reindex(times).fillna(0)
+    p_ac_cs_aligned = p_ac_cs.reindex(times).fillna(0)
+
     out = pd.DataFrame({
         "ghi_wm2":          ghi_all.reindex(times).fillna(0).clip(0).values,
         "poa_wm2":          poa_eff.reindex(times).fillna(0).clip(0).values,
         "ghi_clear_wm2":    cs["ghi_clear"].reindex(times).fillna(0).values,
         "poa_clear_wm2":    cs.get("poa_clear", pd.Series(0, index=times)).reindex(times).fillna(0).values,
-        "power_kw":         p_ac.reindex(times).fillna(0).values,
-        "power_clear_kw":   p_ac_cs.reindex(times).fillna(0).values,
-        "energy_kwh":       p_ac.reindex(times).fillna(0).values,
-        "energy_kwh_cs":    p_ac_cs.reindex(times).fillna(0).values,
+        "power_kw":         p_ac_aligned.values,
+        "power_clear_kw":   p_ac_cs_aligned.values,
+        # Energy is power × timestep (kW × h = kWh) — not the raw power column.
+        "energy_kwh":       (p_ac_aligned * timestep_hours).values,
+        "energy_kwh_cs":    (p_ac_cs_aligned * timestep_hours).values,
         "kt":               kt.reindex(times).fillna(0).values,
         "t_cell_c":         t_cell.reindex(times).fillna(25.0).values,
         "cloud_cover_frac": cloud_frac.values,
@@ -409,14 +513,22 @@ def run_demo_forecast(
     }, index=times)
     out.index.name = "timestamp_utc"
 
+    confidence = _confidence_score(
+        weather_available=weather_available,
+        cloud_data_available=cloud_data_available,
+        ai_used=ai_was_applied,
+        sr_custom=bool(sr_csv),
+        cams_used=False,  # CAMS is opt-in; flipped True when training data is wired
+    )
+
     return {
         "hourly":           out,
-        "summary":          _summary(out, capacity_kw),
+        "summary":          _summary(out, capacity_kw, timestep_hours, resolution, confidence),
         "clearsky_hourly":  cs.reindex(times),
         "location": {
             "lat": lat, "lon": lon, "altitude": altitude,
             "tilt": tilt, "azimuth": azimuth,
             "capacity_kw": capacity_kw, "technology": technology,
-            "iam_model": iam_model,
+            "iam_model": iam_model, "resolution": resolution,
         },
     }

@@ -65,7 +65,31 @@ class ForecastRequest(BaseModel):
     technology: str = Field("mono_si")
     timezone: str = Field("UTC")
     horizon_days: int = Field(7, ge=1, le=14)
-    use_ai: bool = Field(False)
+    use_ai: bool = Field(False, description="Enable XGBoost AI Kt correction (requires trained model).")
+    sr_csv_path: Optional[str] = Field(
+        None,
+        description="Server-side path to a custom SR(λ) CSV (wavelength_nm, sr_value).",
+    )
+    iam_model: str = Field(
+        "ashrae",
+        description="IAM model: 'ashrae' | 'martin_ruiz' | 'fresnel'.",
+    )
+    resolution: str = Field(
+        "hourly",
+        description="Forecast time-step: 'hourly' (default) or '15min' (Pro/Expert).",
+    )
+
+    @validator("resolution")
+    def validate_resolution(cls, v):
+        if v not in {"hourly", "15min"}:
+            raise ValueError("resolution must be 'hourly' or '15min'")
+        return v
+
+    @validator("iam_model")
+    def validate_iam(cls, v):
+        if v not in {"ashrae", "martin_ruiz", "fresnel"}:
+            raise ValueError("iam_model must be one of ashrae | martin_ruiz | fresnel")
+        return v
 
 
 class HourlyPoint(BaseModel):
@@ -85,6 +109,10 @@ class ForecastSummary(BaseModel):
     peak_hour_utc: str
     capacity_factor_pct: float
     cloud_loss_pct: float
+    confidence_pct: float = 0.0
+    confidence_label: str = "Unknown"
+    confidence_reasons: list[str] = []
+    resolution: str = "hourly"
     location: Optional[dict[str, Any]] = None
 
 

@@ -45,6 +45,10 @@ def _build_response(result: dict, location_id: Optional[int] = None) -> Forecast
         peak_hour_utc=str(s.get("peak_hour_utc", "")),
         capacity_factor_pct=round(float(s.get("capacity_factor_pct", 0)), 2),
         cloud_loss_pct=round(float(s.get("cloud_loss_pct", 0)), 2),
+        confidence_pct=round(float(s.get("confidence_pct", 0)), 1),
+        confidence_label=str(s.get("confidence_label", "Unknown")),
+        confidence_reasons=list(s.get("confidence_reasons", [])),
+        resolution=str(s.get("resolution", "hourly")),
     )
 
     return ForecastOut(
@@ -67,7 +71,11 @@ def run_forecast(req: ForecastRequest):
             tilt=req.tilt,
             azimuth=req.azimuth,
             technology=req.technology,
+            iam_model=req.iam_model,
             horizon_days=req.horizon_days,
+            sr_csv=req.sr_csv_path,
+            use_ai=req.use_ai,
+            resolution=req.resolution,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
@@ -104,6 +112,7 @@ def get_location_forecast(location_id: int, horizon_days: int = Query(7, ge=1, l
             azimuth=loc.get("azimuth"),
             technology=loc.get("technology", "mono_si"),
             horizon_days=horizon_days,
+            resolution="hourly",
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))

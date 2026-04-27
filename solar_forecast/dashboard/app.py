@@ -113,11 +113,12 @@ _init_db()
 # Forecast cache
 # ═══════════════════════════════════════════════════════════════════
 @st.cache_data(ttl=1800, show_spinner=False)
-def _forecast(lat, lon, alt, cap, tilt, az, tech, iam, horizon, use_ai, sr_csv, _key):
+def _forecast(lat, lon, alt, cap, tilt, az, tech, iam, horizon, use_ai, sr_csv, resolution, _key):
     return run_demo_forecast(
         lat=lat, lon=lon, altitude=alt, capacity_kw=cap,
         tilt=tilt, azimuth=az, technology=tech, iam_model=iam,
         horizon_days=horizon, sr_csv=sr_csv, use_ai=use_ai,
+        resolution=resolution,
     )
 
 
@@ -200,6 +201,7 @@ def _sidebar():
         horizon = 7
         tz    = "Europe/Budapest"
 
+        resolution = "hourly"
         if level >= 2:
             st.divider()
             st.markdown('<span class="badge-pro">PRO</span>', unsafe_allow_html=True)
@@ -209,6 +211,10 @@ def _sidebar():
                              help="180=South, 90=East, 270=West")
             tech     = st.selectbox("Panel type", list(_TECH), format_func=lambda k: _TECH[k])
             horizon  = st.slider("Forecast days", 1, 14, 7)
+            resolution = st.radio(
+                "Forecast resolution", ["hourly", "15min"], horizontal=True, index=0,
+                help="15-min mode upsamples Open-Meteo via time-aware interpolation.",
+            )
             tz       = st.selectbox("Timezone", _TIMEZONES, index=1)
 
         # ── EXPERT options ────────────────────────────────────────
@@ -240,6 +246,7 @@ def _sidebar():
         tilt=tilt, az=az, tech=tech, iam=iam_model,
         horizon=horizon, tz=tz if level >= 2 else "UTC",
         use_ai=use_ai, sr_csv=sr_csv,
+        resolution=resolution,
         loc_name=loc_name, level=level,
     )
 
@@ -320,7 +327,7 @@ def tab_dashboard(cfg: dict):
             result = _forecast(
                 cfg["lat"], cfg["lon"], cfg["alt"], cfg["cap"],
                 cfg["tilt"], cfg["az"], cfg["tech"], cfg["iam"],
-                cfg["horizon"], cfg["use_ai"], cfg["sr_csv"], key,
+                cfg["horizon"], cfg["use_ai"], cfg["sr_csv"], cfg["resolution"], key,
             )
         except Exception as exc:
             st.error(f"Forecast error: {exc}")
@@ -359,12 +366,19 @@ def tab_dashboard(cfg: dict):
         st.metric("Technology", _TECH.get(cfg["tech"], cfg["tech"]))
         st.metric("IAM model", cfg["iam"].replace("_", "-").title())
 
-        conf_pct = max(0, 100 - s["cloud_loss_pct"])
-        st.markdown(f"**Forecast confidence:** {conf_pct:.0f}%")
+        conf_pct    = float(s.get("confidence_pct", max(0, 100 - s["cloud_loss_pct"])))
+        conf_label  = s.get("confidence_label", "Unknown")
+        conf_reasons = s.get("confidence_reasons", [])
+        st.markdown(f"**Forecast confidence:** {conf_pct:.0f}% &nbsp;·&nbsp; *{conf_label}*",
+                    unsafe_allow_html=True)
         st.markdown(
             f'<div class="conf-bar"><div class="conf-fill" style="width:{conf_pct}%"></div></div>',
             unsafe_allow_html=True,
         )
+        if conf_reasons:
+            with st.expander("Why this confidence?"):
+                for r in conf_reasons:
+                    st.markdown(f"- {r}")
 
     st.markdown('<div class="section-title">Daily energy ({}-day)</div>'.format(cfg["horizon"]),
                 unsafe_allow_html=True)
@@ -380,7 +394,7 @@ def tab_forecast(cfg: dict):
         result = _forecast(
             cfg["lat"], cfg["lon"], cfg["alt"], cfg["cap"],
             cfg["tilt"], cfg["az"], cfg["tech"], cfg["iam"],
-            cfg["horizon"], cfg["use_ai"], cfg["sr_csv"], key,
+            cfg["horizon"], cfg["use_ai"], cfg["sr_csv"], cfg["resolution"], key,
         )
     except Exception as exc:
         st.error(str(exc)); return
@@ -467,7 +481,7 @@ def tab_reports(cfg: dict):
         result = _forecast(
             cfg["lat"], cfg["lon"], cfg["alt"], cfg["cap"],
             cfg["tilt"], cfg["az"], cfg["tech"], cfg["iam"],
-            cfg["horizon"], cfg["use_ai"], cfg["sr_csv"], key,
+            cfg["horizon"], cfg["use_ai"], cfg["sr_csv"], cfg["resolution"], key,
         )
     except Exception as exc:
         st.error(str(exc)); return
