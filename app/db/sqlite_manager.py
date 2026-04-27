@@ -114,7 +114,11 @@ def create_location(data: dict[str, Any]) -> dict[str, Any]:
             f"INSERT INTO locations ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
             vals,
         )
-        return get_location(cur.lastrowid)
+        new_id = cur.lastrowid
+        row = con.execute(
+            "SELECT * FROM locations WHERE id = ?", (new_id,)
+        ).fetchone()
+        return dict(row) if row else None
 
 
 def update_location(location_id: int, data: dict[str, Any]) -> Optional[dict[str, Any]]:
