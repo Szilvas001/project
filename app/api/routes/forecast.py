@@ -14,9 +14,12 @@ from fastapi.responses import StreamingResponse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from app.api.models import ForecastOut, ForecastRequest, ForecastSummary, HourlyPoint
+from app.api.models import (
+    ForecastOut, ForecastRequest, ForecastSummary, HourlyPoint,
+    RealtimeOut, RealtimePoint, RealtimeRequest,
+)
 from app.db import sqlite_manager as db
-from solar_forecast.demo.pipeline import run_demo_forecast
+from solar_forecast.demo.pipeline import run_demo_forecast, run_realtime_forecast
 
 router = APIRouter(tags=["forecast"])
 
@@ -142,4 +145,62 @@ def export_csv(location_id: int, date: Optional[str] = None):
         iter([buf.getvalue()]),
         media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+@router.post("/forecast/realtime", response_model=RealtimeOut, tags=["forecast"])
+def get_realtime_forecast(req: RealtimeRequest):
+    """Sub-hourly real-time production estimate with a smooth continuous curve.
+
+    Returns the current power estimate (`now_power_kw`) and a fine-resolution
+    curve for the next ``horizon_hours`` hours.  The ``resolution_minutes``
+    parameter controls the time step (5–60 min, default 15 min).
+
+    Use cases
+    ---------
+    * **Basic** — poll every minute to display a live power gauge.
+    * **Pro**   — render a smooth 24-hour production curve that auto-updates.
+    * **Expert** — enable ``use_ai_ghi=true`` with a pre-trained GHI model for
+      data-driven irradiance correction on top of the physics model.
+    """
+    try:
+        result = run_realtime_forecast(
+            lat=req.lat,
+            lon=req.lon,
+            altitude=req.altitude,
+            capacity_kw=req.capacity_kw,
+            tilt=req.tilt,
+            azimuth=req.azimuth,
+            technology=req.technology,
+            iam_model=req.iam_model,
+            resolution_minutes=req.resolution_minutes,
+            horizon_hours=req.horizon_hours,
+            use_ai_ghi=req.use_ai_ghi,
+            ghi_model_path=req.ghi_model_path,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    curve_df: pd.DataFrame = result["curve"]
+    curve_pts = [
+        RealtimePoint(
+            timestamp_utc=str(row.Index),
+            ghi_wm2=float(row.ghi_wm2) if pd.notna(row.ghi_wm2) else 0.0,
+            ghi_clear_wm2=float(row.ghi_clear_wm2) if pd.notna(row.ghi_clear_wm2) else 0.0,
+            poa_wm2=float(row.poa_wm2) if pd.notna(row.poa_wm2) else 0.0,
+            power_kw=float(row.power_kw) if pd.notna(row.power_kw) else 0.0,
+            kt=float(row.kt) if pd.notna(row.kt) else None,
+            t_cell_c=float(row.t_cell_c) if pd.notna(row.t_cell_c) else None,
+            cloud_cover_frac=float(row.cloud_cover_frac) if pd.notna(row.cloud_cover_frac) else None,
+        )
+        for row in curve_df.itertuples()
+    ]
+
+    return RealtimeOut(
+        now_power_kw=result["now_power_kw"],
+        now_utc=result["now_utc"],
+        curve=curve_pts,
+        atmosphere=result.get("atmosphere"),
+        location=result.get("location"),
+        generated_at=datetime.now(timezone.utc).isoformat(),
     )

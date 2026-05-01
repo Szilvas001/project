@@ -1,0 +1,57 @@
+# CAMS Fetcher — default config.
+# Override with --config /path/to/your.yaml. Coordinates can be edited freely.
+
+# Target coordinates
+target:
+  name: "Budapest"
+  lat: 47.4979
+  lon: 19.0402
+  area_margin: 0.5    # bounding box (lat ± margin, lon ± margin)
+
+# Forecast schedule (UTC). Value = hour-of-day after which a run becomes available.
+schedule:
+  "00:00": 10
+  "12:00": 22
+
+# Backfill missing runs
+backfill:
+  enabled: true
+  max_per_run: 50
+
+email:
+  enabled: false
+  recipient: ""
+
+# Datasets — every entry maps to one CAMS API request and one PG table
+datasets:
+
+  - name: surface_composition
+    dataset: cams-global-atmospheric-composition-forecasts
+    variables:
+      - total_column_ozone
+      - total_column_water_vapour
+      - total_aerosol_optical_depth_550nm
+      - total_aerosol_optical_depth_469nm
+      - total_aerosol_optical_depth_670nm
+      - total_aerosol_optical_depth_865nm
+      - total_aerosol_optical_depth_1240nm
+      - boundary_layer_height
+      - 2m_temperature
+      - surface_pressure
+    leadtime_hours: "0-48"
+    target_table: cams_surface
+    primary_key: [reference_time, forecast_hours]
+    unit_adjustments: {}
+
+  - name: aerosol_species
+    dataset: cams-global-atmospheric-composition-forecasts
+    variables:
+      - dust_aerosol_optical_depth_550nm
+      - black_carbon_aerosol_optical_depth_550nm
+      - organic_matter_aerosol_optical_depth_550nm
+      - sea_salt_aerosol_optical_depth_550nm
+      - sulphate_aerosol_optical_depth_550nm
+    leadtime_hours: "0-48"
+    target_table: cams_species
+    primary_key: [reference_time, forecast_hours]
+    unit_adjustments: {}
