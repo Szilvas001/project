@@ -93,3 +93,39 @@ class ForecastOut(BaseModel):
     summary: ForecastSummary
     hourly: list[HourlyPoint]
     generated_at: str
+    atmosphere: Optional[dict[str, Any]] = None
+
+
+class RealtimePoint(BaseModel):
+    timestamp_utc: str
+    ghi_wm2: float
+    ghi_clear_wm2: float
+    poa_wm2: float
+    power_kw: float
+    kt: Optional[float]
+    t_cell_c: Optional[float]
+    cloud_cover_frac: Optional[float]
+
+
+class RealtimeRequest(BaseModel):
+    lat: float = Field(..., ge=-90.0, le=90.0)
+    lon: float = Field(..., ge=-180.0, le=180.0)
+    altitude: float = Field(0.0, ge=0.0)
+    capacity_kw: float = Field(5.0, gt=0.0)
+    tilt: Optional[float] = Field(None, ge=0.0, le=90.0)
+    azimuth: Optional[float] = Field(None, ge=0.0, le=360.0)
+    technology: str = Field("mono_si")
+    iam_model: str = Field("ashrae")
+    resolution_minutes: int = Field(15, ge=5, le=60)
+    horizon_hours: int = Field(24, ge=1, le=72)
+    use_ai_ghi: bool = Field(False)
+    ghi_model_path: Optional[str] = Field(None)
+
+
+class RealtimeOut(BaseModel):
+    now_power_kw: float
+    now_utc: str
+    curve: list[RealtimePoint]
+    atmosphere: Optional[dict[str, Any]] = None
+    location: Optional[dict[str, Any]] = None
+    generated_at: str

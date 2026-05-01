@@ -43,6 +43,64 @@ _PW_CM     = 1.5
 _PRESSURE  = 1013.25
 _ALBEDO    = 0.20
 
+
+def _resolve_atmosphere(times: pd.DataFrame, lat: float, lon: float) -> dict:
+    """Pull CAMS atmospheric state if available; fall back to climatology.
+
+    Returned dict keys are scalars or 1-D arrays aligned to `times`. Anything
+    missing from CAMS is filled with the continental-Europe climatology
+    constants defined above. The pipeline therefore degrades gracefully:
+    full physics if CAMS is online, climatology otherwise.
+    """
+    n = len(times)
+    fallback = {
+        "aod_550nm":          np.full(n, _AOD_550),
+        "angstrom_alpha1":    np.full(n, _ALPHA1),
+        "angstrom_alpha2":    np.full(n, _ALPHA2),
+        "ssa":                np.full(n, _SSA),
+        "asymmetry":          np.full(n, _ASYM),
+        "ozone_du":           np.full(n, _OZONE_DU),
+        "precipitable_water": np.full(n, _PW_CM),
+        "surface_pressure":   np.full(n, _PRESSURE),
+        "ground_albedo":      np.full(n, _ALBEDO),
+        "source":             "climatology",
+    }
+
+    try:
+        from solar_forecast.data_ingestion.cams_query import (
+            load_cams_atmospheric_state, derive_extras,
+        )
+        cams = load_cams_atmospheric_state(times, lat, lon)
+        cams = derive_extras(cams)
+    except Exception as exc:
+        logger.debug("CAMS query unavailable (%s) — climatology", exc)
+        return fallback
+
+    if cams is None or cams.empty:
+        return fallback
+
+    def _col(name, default):
+        if name in cams.columns:
+            v = cams[name].astype(float).reindex(times)
+            v = v.interpolate("time").bfill().ffill()
+            return v.fillna(default).values
+        return np.full(n, default)
+
+    out = {
+        "aod_550nm":          _col("aod_550nm",          _AOD_550),
+        "angstrom_alpha1":    _col("angstrom_alpha1",    _ALPHA1),
+        "angstrom_alpha2":    _col("angstrom_alpha2",    _ALPHA2),
+        "ssa":                _col("ssa_mix",            _SSA),
+        "asymmetry":          _col("asym_mix",           _ASYM),
+        "ozone_du":           _col("ozone_du",           _OZONE_DU),
+        "precipitable_water": _col("precipitable_water", _PW_CM),
+        "surface_pressure":   _col("surface_pressure_hpa", _PRESSURE),
+        "ground_albedo":      np.full(n, _ALBEDO),
+        "source":             "cams",
+    }
+    logger.info("atmospheric state: CAMS (%d hourly samples)", n)
+    return out
+
 # Technology temperature coefficients %/°C → /K
 _TEMP_COEFF = {
     "mono_si": -0.0040, "poly_si": -0.0042,
@@ -110,17 +168,35 @@ def _fetch_openmeteo(lat: float, lon: float, horizon_days: int) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def _build_clearsky(lat, lon, altitude, tilt, azimuth, times):
-    """Run SPECTRL2 clear-sky engine. Returns DataFrame."""
+def _build_clearsky(lat, lon, altitude, tilt, azimuth, times, atmosphere=None):
+    """Run SPECTRL2 clear-sky engine. Returns DataFrame.
+
+    Uses per-timestep atmospheric state from `atmosphere` (output of
+    `_resolve_atmosphere`) when provided, falling back to climatological
+    constants otherwise. SPECTRL2 takes scalar AOD / α / SSA / g, so we pass
+    the time-mean of each variable; per-step variation is captured by the
+    Kt model further down the pipeline.
+    """
+    atm = atmosphere or {}
+    aod = float(np.nanmean(atm.get("aod_550nm",          [_AOD_550])))
+    a1  = float(np.nanmean(atm.get("angstrom_alpha1",    [_ALPHA1])))
+    a2  = float(np.nanmean(atm.get("angstrom_alpha2",    [_ALPHA2])))
+    pw  = float(np.nanmean(atm.get("precipitable_water", [_PW_CM])))
+    o3  = float(np.nanmean(atm.get("ozone_du",           [_OZONE_DU])))
+    p   = float(np.nanmean(atm.get("surface_pressure",   [_PRESSURE])))
+    alb = float(np.nanmean(atm.get("ground_albedo",      [_ALBEDO])))
+    ssa = float(np.nanmean(atm.get("ssa",                [_SSA])))
+    g   = float(np.nanmean(atm.get("asymmetry",          [_ASYM])))
+
     try:
         from solar_forecast.clearsky.spectrl2_model import compute_clearsky
         return compute_clearsky(
             times=times, lat=lat, lon=lon, altitude=altitude,
             tilt=tilt, azimuth=azimuth,
-            aod_550nm=_AOD_550, angstrom_alpha=_ALPHA1, angstrom_alpha2=_ALPHA2,
-            precipitable_water=_PW_CM, ozone_du=_OZONE_DU,
-            surface_pressure=_PRESSURE, ground_albedo=_ALBEDO,
-            ssa=_SSA, asymmetry_param=_ASYM,
+            aod_550nm=aod, angstrom_alpha=a1, angstrom_alpha2=a2,
+            precipitable_water=pw, ozone_du=o3,
+            surface_pressure=p, ground_albedo=alb,
+            ssa=ssa, asymmetry_param=g,
             return_spectra=False,
         )
     except Exception as exc:
@@ -153,8 +229,12 @@ def _build_clearsky(lat, lon, altitude, tilt, azimuth, times):
             return pd.DataFrame()
 
 
-def _physics_kt(weather: pd.DataFrame, cs: pd.DataFrame) -> pd.Series:
-    """Physics Kt from cloud cover + aerosol (Delta-Eddington)."""
+def _physics_kt(weather: pd.DataFrame, cs: pd.DataFrame, atmosphere: Optional[dict] = None) -> pd.Series:
+    """Physics Kt from cloud cover + aerosol (Delta-Eddington).
+
+    When `atmosphere` is provided (CAMS), per-timestep AOD, SSA and
+    asymmetry parameter are used instead of climatological scalars.
+    """
     try:
         from solar_forecast.allsky.physics_kt import (
             compute_physics_kt, estimate_cod_from_cover,
@@ -163,7 +243,10 @@ def _physics_kt(weather: pd.DataFrame, cs: pd.DataFrame) -> pd.Series:
         cod    = estimate_cod_from_cover(cloud.values)
         cos_z  = cs["cos_zenith"].clip(0.001).values
         am     = cs.get("airmass", pd.Series(2.0, index=cs.index)).fillna(2.0).values
-        aod    = np.full(len(cs), _AOD_550)
+        atm    = atmosphere or {}
+        aod    = np.asarray(atm.get("aod_550nm", np.full(len(cs), _AOD_550)))
+        ssa    = float(np.nanmean(atm.get("ssa",       [_SSA])))
+        asym   = float(np.nanmean(atm.get("asymmetry", [_ASYM])))
         ghi_cs = cs["ghi_clear"].values
         dni_cs = cs["dni_clear"].values
         dhi_cs = cs["dhi_clear"].values
@@ -172,7 +255,7 @@ def _physics_kt(weather: pd.DataFrame, cs: pd.DataFrame) -> pd.Series:
             cloud_cover=cloud.values, cloud_optical_depth=cod,
             cos_zenith=cos_z, airmass=am, aod_550nm=aod,
             ghi_clear=ghi_cs, dni_clear=dni_cs, dhi_clear=dhi_cs,
-            ssa=_SSA, asymmetry=_ASYM,
+            ssa=ssa, asymmetry=asym,
         )
         return pd.Series(np.clip(kt, 0, 1.2), index=cs.index)
     except Exception as exc:
@@ -193,14 +276,14 @@ def _iam_correction(cs: pd.DataFrame, tilt: float, iam_model: str) -> pd.Series:
         return pd.Series(0.96, index=cs.index)
 
 
-def _poa_from_components(weather, cs, lat, lon, tilt, azimuth):
+def _poa_from_components(weather, cs, lat, lon, tilt, azimuth, atmosphere=None):
     """Perez transposition of all-sky GHI/DNI/DHI → POA."""
     try:
         import pvlib
         loc     = pvlib.location.Location(lat, lon)
         times   = cs.index
         sp      = loc.get_solarposition(times)
-        kt      = _physics_kt(weather, cs)
+        kt      = _physics_kt(weather, cs, atmosphere)
         ghi_all = (kt * cs["ghi_clear"].clip(0)).clip(0)
         dhi_all = (weather.get("dhi", cs["dhi_clear"] * kt)
                    .reindex(times).fillna(cs["dhi_clear"] * kt))
@@ -215,7 +298,7 @@ def _poa_from_components(weather, cs, lat, lon, tilt, azimuth):
         return ghi_all, poa["poa_global"].fillna(0).clip(0), kt
     except Exception as exc:
         logger.warning("Perez failed (%s)", exc)
-        kt   = _physics_kt(weather, cs)
+        kt   = _physics_kt(weather, cs, atmosphere)
         ghi  = (kt * cs["ghi_clear"]).clip(0)
         poa  = (kt * cs["poa_clear"]).clip(0)
         return ghi, poa, kt
@@ -297,8 +380,11 @@ def run_demo_forecast(
     else:
         times = weather.index
 
-    # 2. SPECTRL2 clear-sky
-    cs = _build_clearsky(lat, lon, altitude, tilt, azimuth, times)
+    # 2a. CAMS atmosphere (or climatology fallback)
+    atmosphere = _resolve_atmosphere(times, lat, lon)
+
+    # 2b. SPECTRL2 clear-sky (uses CAMS-tuned AOD, α, ozone, PW, SSA, g)
+    cs = _build_clearsky(lat, lon, altitude, tilt, azimuth, times, atmosphere)
     if cs.empty:
         logger.error("Clear-sky computation failed completely.")
         cs = pd.DataFrame({
@@ -307,8 +393,8 @@ def run_demo_forecast(
             "zenith": 90.0, "azimuth_sun": 180.0, "aoi": 30.0,
         }, index=times)
 
-    # 3. All-sky: Perez transposition + physics Kt
-    ghi_all, poa_all, kt = _poa_from_components(weather, cs, lat, lon, tilt, azimuth)
+    # 3. All-sky: Perez transposition + physics Kt (CAMS-aware)
+    ghi_all, poa_all, kt = _poa_from_components(weather, cs, lat, lon, tilt, azimuth, atmosphere)
 
     # 4. Optional AI Kt correction
     if use_ai and Path(kt_model_path).exists():
@@ -380,10 +466,154 @@ def run_demo_forecast(
         "hourly":           out,
         "summary":          _summary(out, capacity_kw),
         "clearsky_hourly":  cs.reindex(times),
+        "atmosphere": {
+            "source":             atmosphere.get("source", "climatology"),
+            "aod_550nm_mean":     float(np.nanmean(atmosphere["aod_550nm"])),
+            "angstrom_alpha1":    float(np.nanmean(atmosphere["angstrom_alpha1"])),
+            "angstrom_alpha2":    float(np.nanmean(atmosphere["angstrom_alpha2"])),
+            "ssa_mean":           float(np.nanmean(atmosphere["ssa"])),
+            "asymmetry_mean":     float(np.nanmean(atmosphere["asymmetry"])),
+            "ozone_du_mean":      float(np.nanmean(atmosphere["ozone_du"])),
+            "precipitable_water_cm": float(np.nanmean(atmosphere["precipitable_water"])),
+            "surface_pressure_hpa":  float(np.nanmean(atmosphere["surface_pressure"])),
+        },
         "location": {
             "lat": lat, "lon": lon, "altitude": altitude,
             "tilt": tilt, "azimuth": azimuth,
             "capacity_kw": capacity_kw, "technology": technology,
             "iam_model": iam_model,
+        },
+    }
+
+
+def run_realtime_forecast(
+    lat: float,
+    lon: float,
+    altitude: float = 0.0,
+    capacity_kw: float = 5.0,
+    tilt: Optional[float] = None,
+    azimuth: Optional[float] = None,
+    technology: str = "mono_si",
+    iam_model: str = "ashrae",
+    resolution_minutes: int = 15,
+    horizon_hours: int = 24,
+    use_ai_ghi: bool = False,
+    ghi_model_path: Optional[str] = None,
+) -> dict:
+    """Sub-hourly real-time production estimate with a smooth continuous curve.
+
+    Runs the same full SPECTRL2 + CAMS + Perez + NOCT + IAM pipeline as
+    `run_demo_forecast` but at finer time resolution (default 15 min) over
+    a short forward horizon (default 24 h).  Also returns the current-moment
+    power estimate and a ``now_utc`` marker.
+
+    When ``use_ai_ghi=True`` and a trained ``HistoricalGHITrainer`` model is
+    available at ``ghi_model_path``, the GHI prediction is corrected by the
+    AI module before being fed into the POA / power calculation.
+
+    Returns
+    -------
+    dict with keys:
+        curve          pd.DataFrame  (UTC index, resolution_minutes freq)
+        now_power_kw   float  — interpolated power at current UTC
+        now_utc        str
+        atmosphere     dict  — atmospheric state diagnostics
+        location       dict
+    """
+    tilt, azimuth = _resolve_tilt_azimuth(lat, tilt, azimuth)
+
+    now = pd.Timestamp.now(tz="UTC")
+    times = pd.date_range(
+        now.floor(f"{resolution_minutes}min"),
+        periods=horizon_hours * (60 // resolution_minutes),
+        freq=f"{resolution_minutes}min",
+        tz="UTC",
+    )
+
+    weather_h = _fetch_openmeteo(lat, lon, max(2, horizon_hours // 24 + 1))
+
+    def _interp_weather(src: pd.DataFrame, idx: pd.DatetimeIndex) -> pd.DataFrame:
+        if src.empty:
+            return pd.DataFrame(index=idx)
+        return src.reindex(src.index.union(idx)).interpolate("time").reindex(idx)
+
+    weather = _interp_weather(weather_h, times)
+    atmosphere = _resolve_atmosphere(times, lat, lon)
+    cs = _build_clearsky(lat, lon, altitude, tilt, azimuth, times, atmosphere)
+
+    if cs.empty:
+        cs = pd.DataFrame({
+            "ghi_clear": 0.0, "dni_clear": 0.0, "dhi_clear": 0.0,
+            "poa_clear": 0.0, "cos_zenith": 0.0, "airmass": 2.0,
+            "zenith": 90.0, "azimuth_sun": 180.0, "aoi": 30.0,
+        }, index=times)
+
+    ghi_all, poa_all, kt = _poa_from_components(weather, cs, lat, lon, tilt, azimuth, atmosphere)
+
+    # Optional AI GHI correction via HistoricalGHITrainer
+    if use_ai_ghi and ghi_model_path and Path(ghi_model_path).exists():
+        try:
+            from solar_forecast.allsky.historical_trainer import HistoricalGHITrainer
+            ghi_trainer = HistoricalGHITrainer.load(ghi_model_path)
+            feat_df = pd.DataFrame({
+                "ghi_clear":       cs["ghi_clear"].values,
+                "cloud_cover":     weather.get("cloud_cover", pd.Series(0.3, index=times)).reindex(times).fillna(0.3).values,
+                "cloud_cover_low": weather.get("cloud_low", pd.Series(0.3, index=times)).reindex(times).fillna(0.3).values,
+                "cos_zenith":      cs.get("cos_zenith", pd.Series(0.7, index=times)).values,
+            }, index=times)
+            ghi_ai = pd.Series(ghi_trainer.predict(feat_df), index=times)
+            ghi_all = ghi_ai.clip(0)
+            logger.info("HistoricalGHITrainer AI correction applied to real-time curve")
+        except Exception as exc:
+            logger.warning("AI GHI correction failed (%s) — physics-only", exc)
+
+    iam = _iam_correction(cs, tilt, iam_model)
+    poa_eff = (poa_all * iam).clip(0)
+    temp_c = weather.get("temp_c", pd.Series(20.0, index=times)).reindex(times).fillna(20.0)
+    t_cell = _cell_temp(poa_eff, temp_c)
+    p_dc = _dc_power(poa_eff, t_cell, capacity_kw, technology)
+    system_loss = 0.97 * 0.98 * 0.98
+    p_ac = (p_dc * system_loss).clip(0)
+
+    cloud_frac = weather.get("cloud_cover", pd.Series(0.3, index=times)).reindex(times).fillna(0.3)
+
+    curve = pd.DataFrame({
+        "ghi_wm2":          ghi_all.reindex(times).fillna(0).clip(0).values,
+        "ghi_clear_wm2":    cs["ghi_clear"].reindex(times).fillna(0).values,
+        "poa_wm2":          poa_eff.reindex(times).fillna(0).clip(0).values,
+        "power_kw":         p_ac.reindex(times).fillna(0).values,
+        "energy_kwh":       (p_ac.reindex(times).fillna(0) * resolution_minutes / 60.0).values,
+        "kt":               kt.reindex(times).fillna(0).values,
+        "t_cell_c":         t_cell.reindex(times).fillna(25.0).values,
+        "cloud_cover_frac": cloud_frac.values,
+    }, index=times)
+    curve.index.name = "timestamp_utc"
+
+    # Interpolate current-moment power
+    try:
+        now_power = float(
+            curve["power_kw"]
+            .reindex(curve.index.union([now]))
+            .interpolate("time")
+            .loc[now]
+        )
+    except Exception:
+        now_power = float(curve["power_kw"].iloc[0]) if not curve.empty else 0.0
+
+    return {
+        "curve":       curve,
+        "now_power_kw": round(now_power, 4),
+        "now_utc":     now.isoformat(),
+        "atmosphere": {
+            "source":             atmosphere.get("source", "climatology"),
+            "aod_550nm_mean":     float(np.nanmean(atmosphere["aod_550nm"])),
+            "ozone_du_mean":      float(np.nanmean(atmosphere["ozone_du"])),
+            "precipitable_water_cm": float(np.nanmean(atmosphere["precipitable_water"])),
+        },
+        "location": {
+            "lat": lat, "lon": lon, "altitude": altitude,
+            "tilt": tilt, "azimuth": azimuth,
+            "capacity_kw": capacity_kw, "technology": technology,
+            "resolution_minutes": resolution_minutes,
         },
     }

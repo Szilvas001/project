@@ -23,7 +23,7 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from app.db import sqlite_manager as db
-from solar_forecast.demo.pipeline import run_demo_forecast
+from solar_forecast.demo.pipeline import run_demo_forecast, run_realtime_forecast
 
 logging.basicConfig(level=logging.WARNING)
 
@@ -497,36 +497,222 @@ def tab_reports(cfg: dict):
 # ═══════════════════════════════════════════════════════════════════
 # Tab: Settings
 # ═══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+# Real-time forecast cache (short TTL)
+# ═══════════════════════════════════════════════════════════════════
+@st.cache_data(ttl=60, show_spinner=False)
+def _realtime(lat, lon, alt, cap, tilt, az, tech, iam, resolution, horizon, _key):
+    return run_realtime_forecast(
+        lat=lat, lon=lon, altitude=alt, capacity_kw=cap,
+        tilt=tilt, azimuth=az, technology=tech, iam_model=iam,
+        resolution_minutes=resolution, horizon_hours=horizon,
+    )
+
+
+def _chart_realtime(curve: pd.DataFrame, tz: str, now_power_kw: float):
+    """Smooth sub-hourly production curve with a 'now' marker."""
+    df = _tz_convert(curve, tz)
+    fig = go.Figure()
+
+    if "ghi_clear_wm2" in df.columns and df["ghi_clear_wm2"].max() > 0:
+        scale = df["power_kw"].max() / max(df["ghi_clear_wm2"].max(), 1)
+        fig.add_trace(go.Scatter(
+            x=df.index,
+            y=(df["ghi_clear_wm2"] * scale).clip(lower=0),
+            name="Clear-sky (scaled)",
+            line=dict(color="#74c0fc", width=1.2, dash="dot"),
+        ))
+
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df["power_kw"].clip(lower=0),
+        name="Forecast",
+        fill="tozeroy",
+        line=dict(color="#F4A503", width=2.5),
+        fillcolor="rgba(244,165,3,0.10)",
+    ))
+
+    now_ts = pd.Timestamp.now(tz="UTC")
+    if tz != "UTC":
+        import pytz
+        now_ts = now_ts.tz_convert(tz)
+    fig.add_vline(x=now_ts, line_dash="solid", line_color="#22c55e", line_width=2,
+                  annotation_text="NOW", annotation_position="top right",
+                  annotation_font_color="#22c55e")
+
+    fig.update_layout(
+        template="plotly_dark", height=320,
+        margin=dict(t=10, b=10, l=0, r=0),
+        yaxis_title="Power (kW)",
+        legend=dict(orientation="h", y=1.05),
+        xaxis=dict(showgrid=False),
+        yaxis=dict(gridcolor="#2a2a3e"),
+        plot_bgcolor="#0E1117", paper_bgcolor="#0E1117",
+    )
+    return fig
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Tab: Real-Time Live Estimate
+# ═══════════════════════════════════════════════════════════════════
+def tab_realtime(cfg: dict):
+    try:
+        from streamlit_autorefresh import st_autorefresh
+        st_autorefresh(interval=60_000, key="rt_refresh")
+    except Exception:
+        pass
+
+    st.markdown(
+        '<div class="hero-card">'
+        '<div class="hero-title">⚡ Real-Time Production</div>'
+        '<div class="hero-sub">Sub-hourly estimate · auto-refresh every 60 s · '
+        'SPECTRL2 + CAMS atmosphere + Perez transposition</div>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    c_res, c_hor = st.columns(2)
+    resolution = c_res.select_slider(
+        "Time resolution", options=[5, 10, 15, 30, 60], value=15,
+        help="Minutes per data point on the curve"
+    )
+    horizon = c_hor.slider("Horizon (hours)", 6, 48, 24)
+
+    key_rt = pd.Timestamp.now(tz="UTC").floor("1min").isoformat()
+    with st.spinner("Computing real-time estimate…"):
+        try:
+            rt = _realtime(
+                cfg["lat"], cfg["lon"], cfg["alt"], cfg["cap"],
+                cfg["tilt"], cfg["az"], cfg["tech"], cfg["iam"],
+                resolution, horizon, key_rt,
+            )
+        except Exception as exc:
+            st.error(f"Real-time forecast error: {exc}")
+            return
+
+    now_kw = rt["now_power_kw"]
+    curve  = rt["curve"]
+    atm    = rt.get("atmosphere", {})
+
+    # Live KPI cards
+    now_utc = pd.Timestamp(rt["now_utc"])
+    day_kwh = float(curve["energy_kwh"].sum())
+    peak_kw = float(curve["power_kw"].max())
+    source  = atm.get("source", "climatology")
+    source_badge = "🛰 CAMS" if source == "cams" else "📊 Climatology"
+
+    cols = st.columns(4)
+    _kpi(cols[0], "Now", f"{now_kw:.3f} kW", now_utc.strftime("%H:%M UTC"))
+    _kpi(cols[1], "Period peak", f"{peak_kw:.2f} kW")
+    _kpi(cols[2], f"{horizon}h energy", f"{day_kwh:.2f} kWh")
+    _kpi(cols[3], "Atmosphere", source_badge, f"AOD {atm.get('aod_550nm_mean', 0):.3f}")
+
+    st.markdown("")
+    st.markdown('<div class="section-title">Continuous power curve</div>', unsafe_allow_html=True)
+    st.plotly_chart(_chart_realtime(curve, cfg.get("tz", "UTC"), now_kw),
+                    use_container_width=True)
+
+    if cfg.get("level", 1) >= 2:
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown('<div class="section-title">Kt (clearness index)</div>',
+                        unsafe_allow_html=True)
+            fig_kt = go.Figure(go.Scatter(
+                x=curve.index, y=curve["kt"].clip(0, 1.2),
+                fill="tozeroy",
+                line=dict(color="#a78bfa", width=1.8),
+                fillcolor="rgba(167,139,250,0.12)",
+            ))
+            fig_kt.update_layout(
+                template="plotly_dark", height=200,
+                margin=dict(t=5, b=5, l=0, r=0),
+                yaxis=dict(range=[0, 1.2], gridcolor="#2a2a3e"),
+                plot_bgcolor="#0E1117", paper_bgcolor="#0E1117",
+            )
+            st.plotly_chart(fig_kt, use_container_width=True)
+        with c2:
+            st.markdown('<div class="section-title">Cell temperature (°C)</div>',
+                        unsafe_allow_html=True)
+            fig_t = go.Figure(go.Scatter(
+                x=curve.index, y=curve["t_cell_c"],
+                line=dict(color="#f87171", width=1.8),
+            ))
+            fig_t.update_layout(
+                template="plotly_dark", height=200,
+                margin=dict(t=5, b=5, l=0, r=0),
+                yaxis=dict(gridcolor="#2a2a3e"),
+                plot_bgcolor="#0E1117", paper_bgcolor="#0E1117",
+            )
+            st.plotly_chart(fig_t, use_container_width=True)
+
+    if cfg.get("level", 1) >= 3:
+        with st.expander("Atmospheric state diagnostics"):
+            st.json({
+                "source":                atm.get("source", "climatology"),
+                "aod_550nm":             round(atm.get("aod_550nm_mean", 0), 4),
+                "ozone_du":              round(atm.get("ozone_du_mean", 0), 1),
+                "precipitable_water_cm": round(atm.get("precipitable_water_cm", 0), 2),
+            })
+        buf = io.StringIO()
+        _tz_convert(curve, cfg.get("tz", "UTC")).to_csv(buf)
+        st.download_button(
+            "⬇ Download real-time curve (CSV)",
+            buf.getvalue().encode(),
+            f"realtime_{cfg['loc_name'].replace(' ','_')}.csv",
+            "text/csv", use_container_width=True,
+        )
+
+
 def tab_settings(cfg: dict):
     st.markdown('<div class="section-title">⚙️ Application Info</div>', unsafe_allow_html=True)
     st.markdown("""
 | | |
 |---|---|
-| **Version** | 2.0.0 |
+| **Version** | 2.1.0 |
 | **Physics engine** | pvlib SPECTRL2 (Bird & Riordan 1986) |
 | **Transposition** | Perez model |
-| **Clear-sky** | SPECTRL2 with Ångström + Hänel aerosol corrections |
+| **Clear-sky** | SPECTRL2 with per-timestep CAMS AOD, α, ozone, SSA, g |
 | **Spectral integration** | ∫ SR(λ) × I(λ) × IAM(θ) dλ |
-| **AI model** | XGBoost Kt regressor, 21 atmospheric features (optional) |
-| **Weather** | Open-Meteo (free, no key) |
-| **Database** | SQLite (locations + forecast cache) |
+| **AI models** | XGBoost Kt regressor (21 features) · HistoricalGHITrainer |
+| **Weather** | Open-Meteo (free, no key) + CAMS atmospheric state |
+| **Database** | SQLite (locations + forecast cache) · PostgreSQL (CAMS) |
+| **Real-time** | Sub-hourly curve (5–60 min), auto-refresh, Now marker |
 """)
     st.divider()
     st.success("✓ Demo mode active — works without CAMS or PostgreSQL")
     ai_path = Path("models/kt_xgb.joblib")
     if ai_path.exists():
-        st.success(f"✓ Trained AI model: {ai_path} ({ai_path.stat().st_size//1024} KB)")
+        st.success(f"✓ Trained XGBoost model: {ai_path} ({ai_path.stat().st_size//1024} KB)")
     else:
-        st.info("ℹ No AI model found — physics-only mode. See Model Training tab.")
+        st.info("ℹ No XGBoost model found — physics-only mode. See Model Training tab.")
+    ghi_path = Path("models/ghi_historical.joblib")
+    if ghi_path.exists():
+        st.success(f"✓ HistoricalGHI model: {ghi_path}")
 
     st.divider()
-    st.markdown("### Enable CAMS for maximum accuracy")
+    st.markdown("### CAMS atmospheric data")
+    cams_ok = False
+    try:
+        import os
+        cams_ok = bool(os.getenv("CAMS_API_KEY") or os.getenv("CADS_KEY"))
+    except Exception:
+        pass
+    if cams_ok:
+        st.success("✓ CAMS API key configured — full physics accuracy enabled")
+    else:
+        st.warning("⚠ No CAMS API key — using climatological aerosol defaults")
     st.markdown("""
+**To enable CAMS:**
 1. Register free at [ads.atmosphere.copernicus.eu](https://ads.atmosphere.copernicus.eu)
 2. Add to `.env`:  `CAMS_API_KEY=UID:KEY`
-3. Run `python scripts/01_download_cams.py`
+3. Run `python -m solar_forecast.cams_fetcher` (one-off) or start the scheduler
 4. Run `python scripts/02_train_kt_model.py --cv 5`
 5. Toggle **AI Kt correction** in Expert settings
+
+**Automated CAMS fetch (cron):**
+```python
+from solar_forecast.cams_fetcher.scheduler import setup_cron
+setup_cron()   # installs crontab entries at 10:15 and 22:15 UTC
+```
 """)
 
 
@@ -573,14 +759,17 @@ python scripts/02_train_kt_model.py --cv 5
 def main():
     cfg = _sidebar()
 
-    tabs = st.tabs(["📊 Dashboard", "☀️ Forecast", "📍 Locations", "📁 Reports",
-                    "⚙️ Settings", "🧠 Model Training"])
+    tabs = st.tabs([
+        "📊 Dashboard", "⚡ Real-Time", "☀️ Forecast",
+        "📍 Locations", "📁 Reports", "⚙️ Settings", "🧠 Model Training",
+    ])
     with tabs[0]: tab_dashboard(cfg)
-    with tabs[1]: tab_forecast(cfg)
-    with tabs[2]: tab_locations(cfg)
-    with tabs[3]: tab_reports(cfg)
-    with tabs[4]: tab_settings(cfg)
-    with tabs[5]: tab_training()
+    with tabs[1]: tab_realtime(cfg)
+    with tabs[2]: tab_forecast(cfg)
+    with tabs[3]: tab_locations(cfg)
+    with tabs[4]: tab_reports(cfg)
+    with tabs[5]: tab_settings(cfg)
+    with tabs[6]: tab_training()
 
 
 if __name__ == "__main__":
