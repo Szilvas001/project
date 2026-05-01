@@ -80,3 +80,45 @@ You need at least 90 days of CAMS data. Extend `--start`/`--end` range.
 
 **Q: How often should I retrain?**  
 Retraining monthly or quarterly is sufficient. The model is stable across seasons once trained on ≥1 year.
+
+---
+
+## Accuracy & limitations
+
+**Q: What is the expected forecast error?**  
+Physics-only Kt RMSE is typically 0.10 – 0.15 over a 24-hour horizon at
+mid-latitudes; with a CAMS-trained XGBoost correction, RMSE drops to
+~0.07 – 0.10. Expressed as kWh, the day-ahead error band on a 5 kW
+residential array is roughly ±10 % in clear-to-partly-cloudy conditions
+and widens to ±20 – 30 % during convective storms or rapidly evolving
+overcast.
+
+**Q: How is the confidence indicator computed?**  
+It is a rule-based score (0 – 100) over five inputs: live-weather
+availability, cloud-cover data, AI Kt model, custom SR curve, and CAMS
+training. The `confidence_reasons` array on every API response lists
+exactly which inputs contributed. It is **not** a calibrated probability.
+
+**Q: Is the 15-minute mode physically resolved at 15-min steps?**  
+No. Open-Meteo source data is hourly. The 15-minute mode upsamples via
+time-aware interpolation. Use it for charting and energy management
+display, **not** for grid-frequency-balancing decisions.
+
+**Q: Are forecasts beyond 7 days reliable?**  
+Numerical-weather-prediction skill drops sharply past D+7. We expose up
+to 14 days because Open-Meteo serves it, but the confidence_pct should
+be read accordingly.
+
+---
+
+## Disclaimer
+
+> **This software is provided for forecasting and modelling purposes
+> only. The output is an estimate of solar electricity production and
+> must not be used as the sole basis for financial, legal, contractual,
+> grid-balancing, safety, or insurance decisions. Actual energy output
+> depends on factors outside the model — module degradation, soiling
+> events, partial shading, inverter clipping, grid curtailment,
+> weather-forecast error, and instrumentation accuracy. The authors
+> make no warranty of fitness for any particular purpose. See
+> LICENSE.txt for the full legal terms.**

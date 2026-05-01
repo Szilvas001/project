@@ -100,6 +100,16 @@ _TIMEZONES  = [
 ]
 _LEVELS = {"Basic": 1, "Pro": 2, "Expert": 3}
 
+# Demo presets (lat, lon, name, altitude_m, default tz)
+_PRESETS = {
+    "Budapest 🇭🇺": (47.4979, 19.0402, "Budapest", 120.0, "Europe/Budapest"),
+    "Madrid 🇪🇸":   (40.4168, -3.7038, "Madrid",   650.0, "Europe/Madrid"),
+    "Berlin 🇩🇪":   (52.5200, 13.4050, "Berlin",    35.0, "Europe/Berlin"),
+    "Cairo 🇪🇬":    (30.0444, 31.2357, "Cairo",     74.0, "Africa/Cairo"),
+    "Sydney 🇦🇺":   (-33.8688, 151.2093, "Sydney",  58.0, "Australia/Sydney"),
+    "Phoenix 🇺🇸":  (33.4484, -112.0740, "Phoenix", 331.0, "US/Mountain"),
+}
+
 
 @st.cache_resource
 def _init_db():
@@ -171,21 +181,32 @@ def _sidebar():
         st.divider()
 
         # ── Location ─────────────────────────────────────────────
-        mode = st.radio("Location", ["City", "GPS"], horizontal=True)
+        mode = st.radio("Location", ["Preset", "City", "GPS"], horizontal=True,
+                        help="Preset = instant demo · City = geocoded · GPS = manual coords")
         lat = lon = alt = None
         loc_name = "Custom"
+        default_tz = "Europe/Budapest"
 
-        if mode == "City":
+        if mode == "Preset":
+            preset = st.selectbox("Demo location", list(_PRESETS.keys()),
+                                  help="One-click preset for fast trials")
+            lat, lon, loc_name, alt, default_tz = _PRESETS[preset]
+
+        elif mode == "City":
             city = st.text_input("City name", value="Budapest", placeholder="e.g. London")
             if st.button("🔍 Find", use_container_width=True):
                 try:
                     lat, lon, loc_name, alt = _geocode(city)
                     st.session_state["geo"] = (lat, lon, loc_name, alt)
-                except Exception as e:
-                    st.error(str(e))
+                    st.success(f"Found {loc_name}")
+                except ValueError as e:
+                    st.warning(f"⚠ {e}. Try a different name or GPS mode.")
+                except Exception:
+                    st.error("Geocoding service unavailable — switch to GPS or try again.")
             geo = st.session_state.get("geo", (47.498, 19.040, "Budapest", 120.0))
             lat, lon, loc_name, alt = geo
-        else:
+
+        else:  # GPS
             c1, c2 = st.columns(2)
             lat = c1.number_input("Lat", -90.0,  90.0,  47.498, 0.001, format="%.4f")
             lon = c2.number_input("Lon", -180.0, 180.0, 19.040, 0.001, format="%.4f")
@@ -199,7 +220,7 @@ def _sidebar():
         tilt = az = None
         tech  = "mono_si"
         horizon = 7
-        tz    = "Europe/Budapest"
+        tz    = default_tz
 
         resolution = "hourly"
         if level >= 2:
@@ -330,8 +351,16 @@ def tab_dashboard(cfg: dict):
                 cfg["horizon"], cfg["use_ai"], cfg["sr_csv"], cfg["resolution"], key,
             )
         except Exception as exc:
-            st.error(f"Forecast error: {exc}")
+            st.error("⚠ We couldn't generate a forecast for this location.")
+            with st.expander("Technical details"):
+                st.code(str(exc))
+            st.info("Try a preset location or check your internet connection.")
             return
+
+    if result["hourly"].empty:
+        st.warning("📭 No forecast data returned. The location may be outside Open-Meteo coverage.")
+        st.info("Try a preset location to verify the system is working.")
+        return
 
     s       = result["summary"]
     hourly  = result["hourly"]
