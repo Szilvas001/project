@@ -4,6 +4,34 @@ All notable changes to **AI Solar Production Forecast SaaS** are documented here
 
 ---
 
+## [2.1.0] — 2026-05-03
+
+### Added
+- **7-table SQLite schema** — `model_versions` table with ML model registry; 6 performance indexes on CAMS/OM/ingestion/forecast/model_versions tables
+- **`GET /model/status`** — returns loaded model files, versions, and training metrics from DB
+- **`GET /model/versions`** — paginated model version history by type (`kt_xgb`, `ghi_historical`)
+- **Pagination on `GET /locations`** — `page`, `per_page`, `search` query params; response is `PaginatedLocations`
+- **`ConfidenceOut` in every `ForecastOut`** — `confidence_pct`, `confidence_label` (High/Medium/Low), `confidence_reasons` list
+- **`iam_model` and `denorm_factor` in `ForecastRequest`** — full SR/IAM/denorm control via API
+- **`spectral_mm` and `iam` fields in `HourlyPoint`** — spectral mismatch factor and IAM correction per timestep
+- **`energy_kwh = power_kw × timestep_hours`** — explicit formula, documented in pipeline and API schema
+- **Audit log wired** — every `POST /forecast` call writes to `forecast_runs`; every ingestion run (backfill + live) writes to `ingestion_runs`
+- **Model versioning** — `register_model_version()` called automatically when saving `KtTrainer` or `HistoricalGHITrainer` models
+- **API version 2.1.0** — bumped in `/health` response and FastAPI metadata
+- **`engine` field in `/health`** — shows `"SPECTRL2 + CAMS + Perez + XGBoost"`
+
+### Changed
+- `ForecastRequest` now validates `technology` and `iam_model` against allowed values
+- `GET /locations` response schema changed from `list[LocationOut]` to `PaginatedLocations`
+- `HourlyPoint.energy_kwh` is now explicitly `power_kw × 1.0` (hourly) instead of a copy
+- `RealtimePoint.energy_kwh` is now explicitly `power_kw × (resolution_minutes / 60)`
+
+### Fixed
+- Removed duplicate `get_location()` definition in `solar_forecast/db/manager.py`
+- `ConfidenceOut` uses `compute_confidence()` (physics-aware) rather than `100 - cloud_loss_pct`
+
+---
+
 ## [2.0.0] — 2026-04-25
 
 ### Added

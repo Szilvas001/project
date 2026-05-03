@@ -316,6 +316,7 @@ class KtTrainer:
             "Kt model: MAE=%.4f  RMSE=%.4f  R²=%.4f  iters=%d",
             metrics["mae"], metrics["rmse"], metrics["r2"], metrics["best_iteration"]
         )
+        self._last_metrics = metrics
         return metrics
 
     def _cross_validate(
@@ -400,6 +401,20 @@ class KtTrainer:
         path.parent.mkdir(parents=True, exist_ok=True)
         joblib.dump(self.pipeline, path)
         logger.info("Kt model saved to %s", path)
+        try:
+            from solar_forecast.db.manager import register_model_version
+            m = getattr(self, "_last_metrics", {})
+            register_model_version(
+                model_type="kt_xgb",
+                version="2.1.0",
+                path=str(path),
+                r2=m.get("r2"),
+                rmse=m.get("rmse"),
+                n_features=len(_FEATURE_COLS),
+                metadata={"n_train": m.get("n_train"), "n_val": m.get("n_val")},
+            )
+        except Exception as exc:
+            logger.warning("model version registration failed: %s", exc)
 
     def load(self, path: str | Path | None = None) -> None:
         path = Path(path or self.model_path)

@@ -476,8 +476,9 @@ def run_demo_forecast(
         "poa_clear_wm2":    cs.get("poa_clear", pd.Series(0, index=times)).reindex(times).fillna(0).values,
         "power_kw":         p_ac.reindex(times).fillna(0).values,
         "power_clear_kw":   p_ac_cs.reindex(times).fillna(0).values,
-        "energy_kwh":       p_ac.reindex(times).fillna(0).values,
-        "energy_kwh_cs":    p_ac_cs.reindex(times).fillna(0).values,
+        # energy_kwh = power_kw × 1h (hourly resolution)
+        "energy_kwh":       (p_ac.reindex(times).fillna(0) * 1.0).values,
+        "energy_kwh_cs":    (p_ac_cs.reindex(times).fillna(0) * 1.0).values,
         "kt":               kt.reindex(times).fillna(0).values,
         "spectral_mm":      mm.reindex(times).fillna(1.0).values,
         "t_cell_c":         t_cell.reindex(times).fillna(25.0).values,

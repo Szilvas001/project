@@ -250,6 +250,7 @@ class HistoricalGHITrainer:
             raise AccuracyTargetNotMet(
                 f"R²={r2:.3f} (≥{r2_min}) RMSE_rel={rmse_rel:.3f} (≤{rmse_rel_max})"
             )
+        self._last_result = result
         return result
 
     # ---- persistence -----------------------------------------------------
@@ -258,11 +259,26 @@ class HistoricalGHITrainer:
         if self.model is None:
             raise RuntimeError("nothing to save — call fit() first")
         Path(path).parent.mkdir(parents=True, exist_ok=True)
+        feats = getattr(self, "_fitted_features", self.features)
         joblib.dump({
             "model": self.model,
             "impl": self._impl,
-            "features": getattr(self, "_fitted_features", self.features),
+            "features": feats,
         }, path)
+        try:
+            from solar_forecast.db.manager import register_model_version
+            r = getattr(self, "_last_result", None)
+            register_model_version(
+                model_type="ghi_historical",
+                version="2.1.0",
+                path=str(path),
+                r2=r.r2 if r else None,
+                rmse=r.rmse if r else None,
+                n_features=len(feats),
+                metadata={"impl": self._impl, "n_train": r.n_train if r else None},
+            )
+        except Exception as exc:
+            log.warning("model version registration failed: %s", exc)
 
     @classmethod
     def load(cls, path: str | Path) -> "HistoricalGHITrainer":

@@ -1,6 +1,6 @@
 """Unified SQLite database manager for Solar Forecast Pro.
 
-Schema (6 tables)
+Schema (7 tables)
 -----------------
   locations                — PV system registry
   cams_atmospheric_forecast — CAMS atmospheric forecast rows
@@ -8,6 +8,7 @@ Schema (6 tables)
   model_feature_frame       — merged feature vectors ready for ML
   ingestion_runs            — audit log for ingestion jobs
   forecast_runs             — audit log for forecast executions
+  model_versions            — versioned ML model registry
 
 PostgreSQL note: all public functions accept an optional ``conn``
 kwarg so callers can pass a psycopg2 connection for Postgres storage.
@@ -173,6 +174,33 @@ CREATE TABLE IF NOT EXISTS forecast_runs (
     confidence_pct  REAL,
     summary_json    TEXT
 );
+
+-- ML model version registry
+CREATE TABLE IF NOT EXISTS model_versions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    model_type   TEXT    NOT NULL,
+    version      TEXT    NOT NULL,
+    path         TEXT    NOT NULL,
+    r2           REAL,
+    rmse         REAL,
+    n_features   INTEGER,
+    trained_at   TEXT    NOT NULL DEFAULT (datetime('now')),
+    metadata_json TEXT
+);
+
+-- Performance indexes (non-unique — idempotent via IF NOT EXISTS)
+CREATE INDEX IF NOT EXISTS ix_cams_loc_valid
+    ON cams_atmospheric_forecast(location_id, valid_time_utc);
+CREATE INDEX IF NOT EXISTS ix_cams_run_time
+    ON cams_atmospheric_forecast(run_time_utc);
+CREATE INDEX IF NOT EXISTS ix_om_loc_valid
+    ON openmeteo_forecast(location_id, valid_time_utc);
+CREATE INDEX IF NOT EXISTS ix_ingestion_source
+    ON ingestion_runs(source, started_at);
+CREATE INDEX IF NOT EXISTS ix_forecast_runs_loc
+    ON forecast_runs(location_id, requested_at);
+CREATE INDEX IF NOT EXISTS ix_model_versions_type
+    ON model_versions(model_type, trained_at);
 """
 
 
@@ -443,3 +471,51 @@ def log_forecast_run(
              json.dumps(summary or {})),
         )
         return cur.lastrowid or 0
+
+
+# ---------------------------------------------------------------------------
+# Model versions
+# ---------------------------------------------------------------------------
+
+def register_model_version(
+    model_type: str,
+    version: str,
+    path: str,
+    r2: Optional[float] = None,
+    rmse: Optional[float] = None,
+    n_features: Optional[int] = None,
+    metadata: Optional[dict] = None,
+) -> int:
+    """Insert a model_versions row; returns the new row id."""
+    create_tables()
+    with get_connection() as con:
+        cur = con.execute(
+            """
+            INSERT INTO model_versions
+                (model_type, version, path, r2, rmse, n_features, metadata_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (model_type, version, path, r2, rmse, n_features,
+             json.dumps(metadata or {})),
+        )
+        return cur.lastrowid or 0
+
+
+def get_model_versions(model_type: Optional[str] = None) -> list[dict]:
+    """Return all model version rows, newest first."""
+    try:
+        create_tables()
+        with get_connection() as con:
+            if model_type:
+                rows = con.execute(
+                    "SELECT * FROM model_versions WHERE model_type = ? ORDER BY trained_at DESC",
+                    (model_type,),
+                ).fetchall()
+            else:
+                rows = con.execute(
+                    "SELECT * FROM model_versions ORDER BY trained_at DESC"
+                ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as exc:
+        log.warning("get_model_versions failed: %s", exc)
+        return []
