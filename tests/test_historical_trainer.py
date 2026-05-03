@@ -14,7 +14,7 @@ from solar_forecast.allsky.historical_trainer import (
 
 
 def _make_trainer():
-    return HistoricalGHITrainer(n_estimators=200, random_state=0)
+    return HistoricalGHITrainer(n_estimators=50, random_state=0)
 
 
 # ── synthesize_training_data ──────────────────────────────────────────────
