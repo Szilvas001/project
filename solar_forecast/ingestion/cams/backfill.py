@@ -66,6 +66,9 @@ def run_backfill(
 
     Returns a status dict: {total_days, fetched, skipped, errors}
     """
+    import datetime as _dt
+    _started_at = _dt.datetime.now(_dt.timezone.utc).isoformat()
+
     if not is_cams_configured() and not dry_run:
         raise RuntimeError(
             "No CAMS credentials found. Set CADS_KEY or CAMS_API_KEY env var, "
@@ -128,6 +131,23 @@ def run_backfill(
         current += timedelta(days=1)
 
     log.info("backfill complete: %s", stats)
+
+    if not dry_run:
+        try:
+            from solar_forecast.db.manager import log_ingestion_run
+            log_ingestion_run(
+                source="cams_backfill",
+                location_id=location_id,
+                rows_inserted=stats["fetched"],
+                rows_skipped=stats["skipped"],
+                errors=stats["errors"],
+                status="ok" if stats["errors"] == 0 else "partial",
+                detail={"days": days, "lat": lat, "lon": lon},
+                started_at=_started_at,
+            )
+        except Exception as exc:
+            log.warning("audit log failed: %s", exc)
+
     return stats
 
 

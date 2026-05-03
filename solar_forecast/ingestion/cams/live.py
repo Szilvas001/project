@@ -77,6 +77,8 @@ def run_live(
 
     Returns a status dict: {run_date, run_time, rows_stored, skipped, error}.
     """
+    _started_at = datetime.now(timezone.utc).isoformat()
+
     if not is_cams_configured() and not dry_run:
         raise RuntimeError(
             "No CAMS credentials found. Set CADS_KEY or CAMS_API_KEY env var, "
@@ -122,6 +124,22 @@ def run_live(
     else:
         status["error"] = "fetch returned None after retries"
         log.warning("live CAMS fetch returned None for %s %s", date_str, time_str)
+
+    if not dry_run:
+        try:
+            from solar_forecast.db.manager import log_ingestion_run
+            log_ingestion_run(
+                source="cams_live",
+                location_id=location_id,
+                rows_inserted=status.get("rows_stored", 0),
+                rows_skipped=1 if status.get("skipped") else 0,
+                errors=1 if status.get("error") else 0,
+                status="skipped" if status.get("skipped") else ("error" if status.get("error") else "ok"),
+                detail={"run_date": date_str, "run_time": time_str, "hours": hours},
+                started_at=_started_at,
+            )
+        except Exception as exc:
+            log.warning("audit log failed: %s", exc)
 
     return status
 

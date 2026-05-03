@@ -54,10 +54,12 @@ def test_locations_crud():
     loc = r.json()
     assert loc["name"] == "API Test"
 
-    # List
+    # List — now returns PaginatedLocations
     r = client.get("/locations")
     assert r.status_code == 200
-    assert any(l["name"] == "API Test" for l in r.json())
+    body = r.json()
+    assert "items" in body and "total" in body
+    assert any(l["name"] == "API Test" for l in body["items"])
 
     # Get
     r = client.get(f"/locations/{loc['id']}")

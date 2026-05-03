@@ -15,8 +15,8 @@ from fastapi.responses import StreamingResponse
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from app.api.models import (
-    ForecastOut, ForecastRequest, ForecastSummary, HourlyPoint,
-    RealtimeOut, RealtimePoint, RealtimeRequest,
+    ConfidenceOut, ForecastOut, ForecastRequest, ForecastSummary,
+    HourlyPoint, RealtimeOut, RealtimePoint, RealtimeRequest,
 )
 from app.db import sqlite_manager as db
 from solar_forecast.demo.pipeline import run_demo_forecast, run_realtime_forecast
@@ -24,22 +24,48 @@ from solar_forecast.demo.pipeline import run_demo_forecast, run_realtime_forecas
 router = APIRouter(tags=["forecast"])
 
 
-def _build_response(result: dict, location_id: Optional[int] = None) -> ForecastOut:
-    hourly_df: pd.DataFrame = result["hourly"]
+def _confidence(result: dict, req_tech: str, use_ai: bool) -> ConfidenceOut:
+    try:
+        from solar_forecast.engine.confidence import compute_confidence
+        atm_src = result.get("atmosphere", {}).get("source", "climatology")
+        c = compute_confidence(
+            atmosphere_source=atm_src,
+            has_openmeteo=not result["hourly"].empty,
+            use_ai=use_ai,
+            has_historical_model=Path("models/ghi_historical.joblib").exists(),
+            technology=req_tech,
+        )
+        return ConfidenceOut(**c)
+    except Exception:
+        return ConfidenceOut(confidence_pct=65, confidence_label="Medium", confidence_reasons=[])
 
-    hourly = [
-        HourlyPoint(
+
+def _build_hourly(hourly_df: pd.DataFrame) -> list[HourlyPoint]:
+    points = []
+    for row in hourly_df.itertuples():
+        # energy_kwh = power_kw × 1h for hourly data (already correctly stored)
+        points.append(HourlyPoint(
             timestamp_utc=str(row.Index),
-            ghi_wm2=float(row.ghi_wm2) if pd.notna(row.ghi_wm2) else 0.0,
-            power_kw=float(row.power_kw) if pd.notna(row.power_kw) else 0.0,
-            energy_kwh=float(row.energy_kwh) if pd.notna(row.energy_kwh) else 0.0,
+            ghi_wm2=float(getattr(row, "ghi_wm2", 0) or 0),
+            power_kw=float(getattr(row, "power_kw", 0) or 0),
+            energy_kwh=float(getattr(row, "energy_kwh", 0) or 0),
             kt=float(row.kt) if hasattr(row, "kt") and pd.notna(row.kt) else None,
             t_cell_c=float(row.t_cell_c) if hasattr(row, "t_cell_c") and pd.notna(row.t_cell_c) else None,
-        )
-        for row in hourly_df.itertuples()
-    ]
+            spectral_mm=float(row.spectral_mm) if hasattr(row, "spectral_mm") and pd.notna(row.spectral_mm) else None,
+            iam=float(row.iam) if hasattr(row, "iam") and pd.notna(row.iam) else None,
+        ))
+    return points
 
+
+def _build_response(
+    result: dict,
+    location_id: Optional[int] = None,
+    technology: str = "mono_si",
+    use_ai: bool = False,
+) -> ForecastOut:
+    hourly_df: pd.DataFrame = result["hourly"]
     s = result["summary"]
+
     summary = ForecastSummary(
         today_kwh=round(float(s.get("today_kwh", 0)), 3),
         tomorrow_kwh=round(float(s.get("tomorrow_kwh", 0)), 3),
@@ -53,14 +79,20 @@ def _build_response(result: dict, location_id: Optional[int] = None) -> Forecast
     return ForecastOut(
         location_id=location_id,
         summary=summary,
-        hourly=hourly,
+        hourly=_build_hourly(hourly_df),
+        confidence=_confidence(result, technology, use_ai),
+        atmosphere=result.get("atmosphere"),
         generated_at=datetime.now(timezone.utc).isoformat(),
     )
 
 
 @router.post("/forecast", response_model=ForecastOut)
 def run_forecast(req: ForecastRequest):
-    """Run a one-off forecast for any coordinates."""
+    """One-off forecast for any coordinates.
+
+    All physics parameters (SR, IAM, denorm) are applied server-side.
+    `energy_kwh` per row = `power_kw × 1h` for hourly resolution.
+    """
     try:
         result = run_demo_forecast(
             lat=req.lat,
@@ -70,11 +102,29 @@ def run_forecast(req: ForecastRequest):
             tilt=req.tilt,
             azimuth=req.azimuth,
             technology=req.technology,
+            iam_model=req.iam_model,
             horizon_days=req.horizon_days,
+            use_ai=req.use_ai,
+            denorm_factor=req.denorm_factor,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
-    return _build_response(result)
+
+    out = _build_response(result, technology=req.technology, use_ai=req.use_ai)
+
+    # Audit log (best-effort)
+    try:
+        from solar_forecast.db.manager import log_forecast_run
+        log_forecast_run(
+            location_id=None,
+            horizon_hours=req.horizon_days * 24,
+            data_tier=result.get("atmosphere", {}).get("source", "demo"),
+            confidence_pct=out.confidence.confidence_pct if out.confidence else None,
+        )
+    except Exception:
+        pass
+
+    return out
 
 
 @router.get("/forecast/{location_id}", response_model=ForecastOut)
@@ -87,9 +137,6 @@ def get_location_forecast(location_id: int, horizon_days: int = Query(7, ge=1, l
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     cached = db.load_forecast(location_id, today)
     if cached:
-        hourly_df = pd.DataFrame(cached["payload"])
-        if not hourly_df.empty:
-            hourly_df.index = pd.to_datetime(hourly_df.get("timestamp_utc", hourly_df.index))
         return ForecastOut(
             location_id=location_id,
             summary=ForecastSummary(**cached["summary"]),
@@ -106,40 +153,37 @@ def get_location_forecast(location_id: int, horizon_days: int = Query(7, ge=1, l
             tilt=loc.get("tilt"),
             azimuth=loc.get("azimuth"),
             technology=loc.get("technology", "mono_si"),
+            iam_model="ashrae",
             horizon_days=horizon_days,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
-    out = _build_response(result, location_id=location_id)
-
-    payload_list = [h.dict() for h in out.hourly]
-    db.save_forecast(location_id, today, payload_list, out.summary.dict())
-
+    out = _build_response(result, location_id=location_id, technology=loc.get("technology", "mono_si"))
+    payload_list = [h.model_dump() for h in out.hourly]
+    db.save_forecast(location_id, today, payload_list, out.summary.model_dump())
     return out
 
 
 @router.get("/export/csv")
 def export_csv(location_id: int, date: Optional[str] = None):
-    """Download forecast as CSV."""
+    """Download a cached forecast as CSV."""
     loc = db.get_location(location_id)
     if not loc:
         raise HTTPException(status_code=404, detail="Location not found")
 
     target_date = date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     cached = db.load_forecast(location_id, target_date)
-
     if not cached:
         raise HTTPException(
             status_code=404,
-            detail="No forecast cached for this location/date. Call GET /forecast/{id} first."
+            detail="No forecast cached for this location/date. Call GET /forecast/{id} first.",
         )
 
     df = pd.DataFrame(cached["payload"])
     buf = io.StringIO()
     df.to_csv(buf, index=False)
     buf.seek(0)
-
     filename = f"forecast_{loc['name'].replace(' ', '_')}_{target_date}.csv"
     return StreamingResponse(
         iter([buf.getvalue()]),
@@ -148,20 +192,12 @@ def export_csv(location_id: int, date: Optional[str] = None):
     )
 
 
-@router.post("/forecast/realtime", response_model=RealtimeOut, tags=["forecast"])
+@router.post("/forecast/realtime", response_model=RealtimeOut)
 def get_realtime_forecast(req: RealtimeRequest):
-    """Sub-hourly real-time production estimate with a smooth continuous curve.
+    """Sub-hourly real-time production estimate.
 
-    Returns the current power estimate (`now_power_kw`) and a fine-resolution
-    curve for the next ``horizon_hours`` hours.  The ``resolution_minutes``
-    parameter controls the time step (5–60 min, default 15 min).
-
-    Use cases
-    ---------
-    * **Basic** — poll every minute to display a live power gauge.
-    * **Pro**   — render a smooth 24-hour production curve that auto-updates.
-    * **Expert** — enable ``use_ai_ghi=true`` with a pre-trained GHI model for
-      data-driven irradiance correction on top of the physics model.
+    Returns `now_power_kw` (interpolated to current UTC) and a fine-resolution
+    production curve. `energy_kwh` per point = `power_kw × (resolution_minutes / 60)`.
     """
     try:
         result = run_realtime_forecast(
@@ -182,16 +218,19 @@ def get_realtime_forecast(req: RealtimeRequest):
         raise HTTPException(status_code=500, detail=str(exc))
 
     curve_df: pd.DataFrame = result["curve"]
+    res_h = req.resolution_minutes / 60.0
+
     curve_pts = [
         RealtimePoint(
             timestamp_utc=str(row.Index),
-            ghi_wm2=float(row.ghi_wm2) if pd.notna(row.ghi_wm2) else 0.0,
-            ghi_clear_wm2=float(row.ghi_clear_wm2) if pd.notna(row.ghi_clear_wm2) else 0.0,
-            poa_wm2=float(row.poa_wm2) if pd.notna(row.poa_wm2) else 0.0,
-            power_kw=float(row.power_kw) if pd.notna(row.power_kw) else 0.0,
-            kt=float(row.kt) if pd.notna(row.kt) else None,
-            t_cell_c=float(row.t_cell_c) if pd.notna(row.t_cell_c) else None,
-            cloud_cover_frac=float(row.cloud_cover_frac) if pd.notna(row.cloud_cover_frac) else None,
+            ghi_wm2=float(getattr(row, "ghi_wm2", 0) or 0),
+            ghi_clear_wm2=float(getattr(row, "ghi_clear_wm2", 0) or 0),
+            poa_wm2=float(getattr(row, "poa_wm2", 0) or 0),
+            power_kw=float(getattr(row, "power_kw", 0) or 0),
+            energy_kwh=round(float(getattr(row, "power_kw", 0) or 0) * res_h, 6),
+            kt=float(row.kt) if hasattr(row, "kt") and pd.notna(row.kt) else None,
+            t_cell_c=float(row.t_cell_c) if hasattr(row, "t_cell_c") and pd.notna(row.t_cell_c) else None,
+            cloud_cover_frac=float(row.cloud_cover_frac) if hasattr(row, "cloud_cover_frac") and pd.notna(row.cloud_cover_frac) else None,
         )
         for row in curve_df.itertuples()
     ]
