@@ -161,7 +161,7 @@ def compute_clearsky(
         mask_pv   = (wl >= _PV_WL_MIN) & (wl <= _PV_WL_MAX)
 
         def _integrate(arr, mask):
-            return max(0.0, float(np.trapz(arr[mask], wl[mask])))
+            return max(0.0, float(np.trapezoid(arr[mask], wl[mask])))
 
         dni_clear = _integrate(dni_spec, mask_full)
         dhi_clear = _integrate(dhi_spec, mask_full)

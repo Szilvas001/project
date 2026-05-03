@@ -11,7 +11,7 @@ Docs:
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import health, locations, forecast
+from app.api.routes import health, locations, forecast, ingestion, features
 from app.db.sqlite_manager import create_tables, seed_demo_location
 
 app = FastAPI(
@@ -33,6 +33,8 @@ app.add_middleware(
 app.include_router(health.router)
 app.include_router(locations.router)
 app.include_router(forecast.router)
+app.include_router(ingestion.router)
+app.include_router(features.router)
 
 
 @app.on_event("startup")

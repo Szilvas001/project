@@ -168,7 +168,8 @@ def _fetch_openmeteo(lat: float, lon: float, horizon_days: int) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def _build_clearsky(lat, lon, altitude, tilt, azimuth, times, atmosphere=None):
+def _build_clearsky(lat, lon, altitude, tilt, azimuth, times, atmosphere=None,
+                    return_spectra: bool = False):
     """Run SPECTRL2 clear-sky engine. Returns DataFrame.
 
     Uses per-timestep atmospheric state from `atmosphere` (output of
@@ -176,6 +177,9 @@ def _build_clearsky(lat, lon, altitude, tilt, azimuth, times, atmosphere=None):
     constants otherwise. SPECTRL2 takes scalar AOD / α / SSA / g, so we pass
     the time-mean of each variable; per-step variation is captured by the
     Kt model further down the pipeline.
+
+    When return_spectra=True, a 'spectra' column is added containing per-step
+    spectral irradiance dicts (for MM calculation with SpectralResponse).
     """
     atm = atmosphere or {}
     aod = float(np.nanmean(atm.get("aod_550nm",          [_AOD_550])))
@@ -197,7 +201,7 @@ def _build_clearsky(lat, lon, altitude, tilt, azimuth, times, atmosphere=None):
             precipitable_water=pw, ozone_du=o3,
             surface_pressure=p, ground_albedo=alb,
             ssa=ssa, asymmetry_param=g,
-            return_spectra=False,
+            return_spectra=return_spectra,
         )
     except Exception as exc:
         logger.warning("SPECTRL2 failed (%s), using simplified_solis", exc)
@@ -304,15 +308,25 @@ def _poa_from_components(weather, cs, lat, lon, tilt, azimuth, atmosphere=None):
         return ghi, poa, kt
 
 
-def _spectral_mismatch(technology: str, sr_csv: Optional[str]) -> float:
-    """Scalar broadband spectral mismatch factor (climatological mean)."""
+def _compute_spectral_mm(
+    cs: pd.DataFrame,
+    technology: str,
+    sr_csv: Optional[str],
+) -> pd.Series:
+    """Per-timestep spectral mismatch factor MM using SPECTRL2 spectra.
+
+    Uses the 'spectra' column added by _build_clearsky(return_spectra=True).
+    Returns a Series aligned to cs.index; night/failure rows → 1.0.
+    """
     try:
         from solar_forecast.production.spectral_response import SpectralResponse
         sr = SpectralResponse(technology=technology, csv_path=sr_csv)
-        # MM for a typical mid-latitude spring day (AM1.5 ≈ 1.0, no correction)
-        return 1.0   # MM applied per-timestep in PVOutputModel; here we return 1
-    except Exception:
-        return 1.0
+        spectra_col = cs.get("spectra", pd.Series([None] * len(cs), index=cs.index))
+        mm_arr = sr.mismatch_series(spectra_col.tolist())
+        return pd.Series(mm_arr, index=cs.index)
+    except Exception as exc:
+        logger.debug("spectral MM failed (%s) → 1.0", exc)
+        return pd.Series(1.0, index=cs.index)
 
 
 def _dc_power(poa_eff: pd.Series, t_cell: pd.Series,
@@ -357,6 +371,7 @@ def run_demo_forecast(
     sr_csv: Optional[str] = None,
     use_ai: bool = False,
     kt_model_path: str = "models/kt_xgb.joblib",
+    denorm_factor: float = 1.0,
 ) -> dict:
     """
     Full physics forecast pipeline (SPECTRL2 + SR + IAM + Perez + NOCT).
@@ -384,7 +399,10 @@ def run_demo_forecast(
     atmosphere = _resolve_atmosphere(times, lat, lon)
 
     # 2b. SPECTRL2 clear-sky (uses CAMS-tuned AOD, α, ozone, PW, SSA, g)
-    cs = _build_clearsky(lat, lon, altitude, tilt, azimuth, times, atmosphere)
+    # Return spectra only when SR/technology differ from reference (for MM computation)
+    _need_spectra = (technology != "mono_si" or sr_csv is not None)
+    cs = _build_clearsky(lat, lon, altitude, tilt, azimuth, times, atmosphere,
+                         return_spectra=_need_spectra)
     if cs.empty:
         logger.error("Clear-sky computation failed completely.")
         cs = pd.DataFrame({
@@ -423,15 +441,20 @@ def run_demo_forecast(
         except Exception as exc:
             logger.warning("AI Kt failed (%s) — physics-only", exc)
 
-    # 5. IAM correction
-    iam = _iam_correction(cs, tilt, iam_model)
-    poa_eff = (poa_all * iam).clip(0)
+    # 5. Spectral mismatch factor MM (technology + SR curve)
+    mm = _compute_spectral_mm(cs, technology, sr_csv) if _need_spectra else pd.Series(1.0, index=times)
 
-    # 6. Cell temperature (NOCT model)
+    # 6. IAM correction (incidence angle modifier)
+    iam = _iam_correction(cs, tilt, iam_model)
+
+    # Apply MM × IAM × denorm_factor to effective POA
+    poa_eff = (poa_all * mm * iam * denorm_factor).clip(0)
+
+    # 8. Cell temperature (NOCT model)
     temp_c = weather.get("temp_c", pd.Series(20.0, index=times)).reindex(times).fillna(20.0)
     t_cell = _cell_temp(poa_eff, temp_c)
 
-    # 7. DC power (with temperature coefficient)
+    # 9. DC power (with temperature coefficient)
     p_dc = _dc_power(poa_eff, t_cell, capacity_kw, technology)
 
     # 8. AC power (inverter + wiring + soiling)
@@ -456,6 +479,7 @@ def run_demo_forecast(
         "energy_kwh":       p_ac.reindex(times).fillna(0).values,
         "energy_kwh_cs":    p_ac_cs.reindex(times).fillna(0).values,
         "kt":               kt.reindex(times).fillna(0).values,
+        "spectral_mm":      mm.reindex(times).fillna(1.0).values,
         "t_cell_c":         t_cell.reindex(times).fillna(25.0).values,
         "cloud_cover_frac": cloud_frac.values,
         "iam":              iam.reindex(times).fillna(0.96).values,
