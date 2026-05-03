@@ -195,8 +195,8 @@ class SpectralResponse:
         am15_wl   = _AM15G[:, 0]
         am15_irr  = _AM15G[:, 1]
         am15_on_sr = np.interp(self._wl, am15_wl, am15_irr, left=0.0, right=0.0)
-        self._am15_sr_integral = np.trapz(self._sr * am15_on_sr, self._wl)
-        self._am15_total       = np.trapz(am15_on_sr, self._wl)
+        self._am15_sr_integral = np.trapezoid(self._sr * am15_on_sr, self._wl)
+        self._am15_total       = np.trapezoid(am15_on_sr, self._wl)
 
     @property
     def name(self) -> str:
@@ -248,8 +248,8 @@ class SpectralResponse:
         # Interpolate onto SR wavelength grid
         g_sr = np.interp(self._wl, wl_in, g_in, left=0.0, right=0.0)
 
-        sr_integral = np.trapz(self._sr * g_sr, self._wl)
-        g_total     = np.trapz(g_sr, self._wl)
+        sr_integral = np.trapezoid(self._sr * g_sr, self._wl)
+        g_total     = np.trapezoid(g_sr, self._wl)
 
         if self._am15_sr_integral < 1e-6 or sr_integral < 1e-6 or g_total < 1e-6:
             return 1.0
@@ -273,7 +273,7 @@ class SpectralResponse:
         g_in  = np.asarray(spectral_irradiance[g_key])
 
         g_sr = np.interp(self._wl, wl_in, g_in, left=0.0, right=0.0)
-        sr_integral = np.trapz(self._sr * g_sr, self._wl)
+        sr_integral = np.trapezoid(self._sr * g_sr, self._wl)
 
         if self._am15_sr_integral < 1e-6 or sr_integral < 1e-6:
             return 1.0

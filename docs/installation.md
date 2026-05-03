@@ -1,98 +1,105 @@
 # Installation
 
-Solar Forecast Pro can be installed in three ways. **Docker is recommended** for production.
+**AI Solar Production Forecast SaaS — Physics + CAMS + Open-Meteo**
 
-## Option 1 — Docker (recommended)
+---
 
-Requirements: Docker + Docker Compose v2.
+## Docker Quickstart (Recommended)
+
+Requires Docker Engine 24+ and Docker Compose v2.
 
 ```bash
-git clone <your-repo-url> solar-forecast-pro
-cd solar-forecast-pro
-cp .env.example .env
+git clone <repo-url> solar-forecast && cd solar-forecast
+cp .env.example .env          # edit secrets — see Environment Variables below
 docker compose up -d
 ```
 
-That's it. Open the dashboard at:
+| Service | URL |
+|---|---|
+| Streamlit dashboard | http://localhost:8501 |
+| FastAPI backend | http://localhost:8000 |
+| Swagger UI | http://localhost:8000/docs |
 
-- **Dashboard** → http://localhost:8501
-- **API** → http://localhost:8000/docs
+Both services share named Docker volumes (`solar_data`, `solar_models`, `solar_cache`), so data persists across restarts.
 
-To shut down:
+### Enable PostgreSQL (CAMS training data only)
+
 ```bash
-docker compose down
+docker compose --profile training up -d   # adds postgres:16 on port 5432
 ```
 
-To enable PostgreSQL for CAMS training:
-```bash
-docker compose --profile training up -d
-```
+PostgreSQL is not needed for normal operation. It is only required when downloading CAMS historical atmospheric data and training the XGBoost Kt model.
 
-## Option 2 — One-command install (Linux/macOS)
+---
 
-Requirements: Python 3.10+ and `bash`.
+## Manual Install
 
-```bash
-git clone <your-repo-url> solar-forecast-pro
-cd solar-forecast-pro
-./install.sh
-./run.sh
-```
-
-The installer creates a virtual environment in `.venv/`, installs all
-dependencies, and initializes the SQLite database with a Budapest demo
-location.
-
-## Option 3 — Manual Python install
+**Requirements:** Python 3.10+, pip 23+.
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env
-
-# Initialize the SQLite DB
-python -c "from app.db.sqlite_manager import create_tables, seed_demo_location; create_tables(); seed_demo_location()"
-
-# Run the dashboard
-streamlit run solar_forecast/dashboard/app.py
-
-# OR run the API
-uvicorn app.api.main:app --host 0.0.0.0 --port 8000
+# or editable install for development:
+pip install -e .
 ```
 
-## Verifying the install
+### Optional: GRIB ingestion (pygrib)
 
 ```bash
-# Health check
-curl http://localhost:8000/health
-
-# Run pytest
-pytest
-
-# Sample forecast
-curl -X POST http://localhost:8000/forecast \
-     -H "Content-Type: application/json" \
-     -d '{"lat": 47.5, "lon": 19.0, "capacity_kw": 5.0, "horizon_days": 1}'
+sudo apt install libeccodes-dev       # Ubuntu / Debian
+pip install pygrib>=2.1.5
 ```
 
-## System requirements
+Only needed if you configure the CAMS fetcher for GRIB output format. Default is NetCDF, which works without `pygrib`.
+
+---
+
+## Environment Variables
+
+Copy `.env.example` to `.env`. All variables are optional in demo mode.
+
+| Variable | Default | Description |
+|---|---|---|
+| `DEMO_MODE` | `true` | Skip CAMS/PostgreSQL; use climatology fallbacks |
+| `CAMS_API_KEY` | — | Copernicus ADS key for CAMS data |
+| `PGHOST` | `localhost` | PostgreSQL host |
+| `PGDATABASE` | `solar_forecast` | PostgreSQL database |
+| `PGUSER` | `solar` | PostgreSQL user |
+| `PGPASSWORD` | `changeme` | PostgreSQL password |
+| `DEFAULT_LAT` | `47.4979` | Dashboard startup latitude |
+| `DEFAULT_LON` | `19.0402` | Dashboard startup longitude |
+| `API_PORT` | `8000` | FastAPI listen port |
+
+---
+
+## Run Services Manually
+
+```bash
+./run.sh                  # dashboard only (port 8501)
+./run.sh --api            # API only (port 8000)
+./run.sh --all            # both services
+
+# Or directly:
+streamlit run solar_forecast/dashboard/app.py --server.port 8501
+uvicorn app.api.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+---
+
+## Verify Installation
+
+```bash
+pytest                                         # full test suite (~30 s)
+pytest tests/test_api.py::test_health          # single health check test
+curl http://localhost:8000/health              # API liveness
+curl http://localhost:8000/locations           # list saved locations
+```
+
+## System Requirements
 
 | Item | Minimum | Recommended |
 |---|---|---|
 | Python | 3.10 | 3.11+ |
 | RAM | 1 GB | 2 GB |
-| Disk | 500 MB | 2 GB (with cache) |
-| Internet | Required for Open-Meteo | Required |
-
-## Troubleshooting
-
-**"Module not found" errors** — Make sure you activated the virtual
-environment (`source .venv/bin/activate`).
-
-**Streamlit won't start on port 8501** — Use `./run.sh --port=8502`.
-
-**Docker build fails on `netcdf`** — Make sure you have at least 2 GB RAM
-allocated to Docker.
-
-See [faq.md](faq.md) for more.
+| Disk | 500 MB | 2 GB (with CAMS cache) |
+| Internet | Required (Open-Meteo) | Required |
